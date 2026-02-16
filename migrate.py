@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Confluence Cloud → Nextcloud Collectives Migration CLI."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 import json
 import logging
@@ -262,12 +262,32 @@ class ConfluenceClient:
     # -- comments ---------------------------------------------------------
 
     def get_page_comments(self, page_id):
-        return list(
+        top_level = list(
             self._paginate(
                 f"/wiki/api/v2/pages/{page_id}/footer-comments",
                 **{"body-format": "storage"},
             )
         )
+        # Recursively fetch reply chains
+        all_comments = []
+        for comment in top_level:
+            all_comments.append(comment)
+            all_comments.extend(self._get_comment_replies(comment["id"]))
+        return all_comments
+
+    def _get_comment_replies(self, comment_id):
+        """Recursively fetch replies (children) of a footer comment."""
+        children = list(
+            self._paginate(
+                f"/wiki/api/v2/footer-comments/{comment_id}/children",
+                **{"body-format": "storage"},
+            )
+        )
+        all_replies = []
+        for child in children:
+            all_replies.append(child)
+            all_replies.extend(self._get_comment_replies(child["id"]))
+        return all_replies
 
     # -- attachments ------------------------------------------------------
 
