@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Confluence Cloud → Nextcloud Collectives Migration CLI."""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 import json
 import logging
@@ -453,7 +453,7 @@ class Converter:
                 mention.replace_with(f"@{display}")
 
         # Rewrite image src to local filenames; remove non-image files (e.g. .mp4)
-        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".bmp", ".webp", ".ico"}
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
         if not self.exclude_images:
             for img in soup.find_all("img"):
                 src = img.get("src", "")
@@ -533,7 +533,7 @@ class Converter:
 
     def generate_attachment_section(self, attachments):
         """Generate ## Attachments section for non-image files."""
-        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".bmp", ".webp", ".ico"}
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
         non_image = []
         for a in attachments:
             title = a.get("title", "")
@@ -636,7 +636,7 @@ class Converter:
         if self.exclude_attachments:
             return copied
 
-        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".bmp", ".webp", ".ico"}
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
         attachments = page_data.get("attachments", [])
 
         for a in attachments:
@@ -703,9 +703,11 @@ class NextcloudClient:
 
     def upload_file(self, local_path, remote_path):
         """Upload a file via PUT."""
+        import mimetypes
         url = f"{self.dav_base}/{remote_path.lstrip('/')}"
+        content_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
         with open(local_path, "rb") as f:
-            resp = self.session.put(url, data=f)
+            resp = self.session.put(url, data=f, headers={"Content-Type": content_type})
         if resp.status_code not in (200, 201, 204):
             raise click.ClickException(
                 f"Upload failed for {remote_path}: HTTP {resp.status_code}"
@@ -932,7 +934,7 @@ def export(space_key, pages, all_spaces, exclude_images, exclude_attachments, dr
                         att_dir = export_base / "attachments" / page_id
                         for att in att_list:
                             att_title = att.get("title", "")
-                            image_exts = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".bmp", ".webp", ".ico"}
+                            image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
                             ext = Path(att_title).suffix.lower()
 
                             if exclude_images and ext in image_exts:
@@ -1359,7 +1361,7 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
                         att_dir = export_base / "attachments" / page_id
                         for att in att_list:
                             att_title = att.get("title", "")
-                            image_exts = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".bmp", ".webp", ".ico"}
+                            image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
                             ext = Path(att_title).suffix.lower()
                             if exclude_images and ext in image_exts:
                                 continue

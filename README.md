@@ -218,6 +218,11 @@ These are development tools only — `migrate.py` has zero MCP dependency and us
 
 ## Changelog
 
+### 0.6.0
+
+- Fix: SVG files are no longer embedded inline via `![](file.svg)` — Nextcloud Collectives blocks SVG rendering for security. SVGs now appear in the `## Attachments` section as clickable links instead (fixes #3)
+- Fix: File uploads now include correct `Content-Type` headers (e.g. `image/svg+xml` for SVGs) — previously Nextcloud defaulted to `text/plain` for unrecognized types
+
 ### 0.5.0
 
 - Fix: Confluence `<hr/>` tags are now stripped during preprocessing — they were converted to `---` which Nextcloud Collectives misinterpreted as YAML front matter, breaking table rendering at the start of pages (fixes #1)
