@@ -175,7 +175,7 @@ convert_data/{space_key}/         # Phase 2 output (uploaded in Phase 3)
 ## Limitations
 
 - **Confluence Cloud only** — Confluence Server/Data Center API differences are not handled.
-- **Flat comments only** — Nested/inline comments are not supported; only top-level footer comments are migrated.
+- **Footer comments only** — Inline comments (annotations on specific text) are not migrated; footer comments and their reply chains are fully supported.
 - **No permission migration** — Page-level permissions from Confluence are not transferred.
 - **Unsupported macros** — Jira, Draw.io, and other third-party macro content is replaced with HTML comments.
 - **Sequential processing** — Pages are processed one at a time (no parallel downloads).
@@ -217,6 +217,15 @@ The `.mcp.json` file configures two MCP servers for development and testing:
 These are development tools only — `migrate.py` has zero MCP dependency and uses direct HTTP requests.
 
 ## Changelog
+
+### 0.5.0
+
+- Fix: Confluence `<hr/>` tags are now stripped during preprocessing — they were converted to `---` which Nextcloud Collectives misinterpreted as YAML front matter, breaking table rendering at the start of pages (fixes #1)
+- Fix: `load_dotenv(override=True)` ensures `.env` values take precedence over stale shell environment variables
+
+### 0.4.0
+
+- Fix: Nested comment replies are now fetched recursively via `/wiki/api/v2/footer-comments/{id}/children` — previously only top-level footer comments were exported, missing reply chains (fixes #2)
 
 ### 0.3.0
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Confluence Cloud → Nextcloud Collectives Migration CLI."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 import json
 import logging
@@ -20,7 +20,7 @@ import requests
 from bs4 import BeautifulSoup, Comment, Tag
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -328,6 +328,11 @@ class Converter:
     def preprocess_html(self, html, attachment_names=None):
         """Clean Confluence HTML before markdown conversion."""
         soup = BeautifulSoup(html, "html.parser")
+
+        # Remove leading <hr> tags — html2text converts them to "---" which
+        # Nextcloud Collectives misinterprets as YAML front matter
+        for el in soup.find_all("hr"):
+            el.decompose()
 
         # Remove attachment management UI + preceding "Attachments" heading
         for el in soup.select("div.plugin_attachments_container"):
