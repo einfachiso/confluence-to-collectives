@@ -950,29 +950,57 @@ def page_route_segments(output_rel_path):
     return [seg for seg in p.split("/") if seg]
 
 
-def build_page_link_map(state, target_parent, collective):
-    """Map Confluence page_id -> absolute Collectives page URL, for resolving
-    `cpage:` placeholders. Collectives resolves internal links by walking the
-    page-title path under the collective, so the URL is
-    /apps/collectives/<collective>/<target_parent>/<title path>.
+def build_page_routes(state, target_parent):
+    """Map Confluence page_id -> Collectives route (page-title segments from the
+    collective root). target_parent is the optional top folder; '' imports
+    directly at the collective base (the space homepage becomes the landing page).
     """
-    link_map = {}
+    prefix = [target_parent] if target_parent else []
+    routes = {}
     for pid, rec in state.pages.items():
         convert_path = rec.get("convert_path")
         if not convert_path:
             continue
         space_key = rec.get("space_key", "default")
         rel = Path(convert_path).relative_to(Path("convert_data") / space_key).as_posix()
-        segments = [collective, target_parent, *page_route_segments(rel)]
-        link_map[pid] = "/apps/collectives/" + "/".join(quote(s) for s in segments)
-    return link_map
+        routes[pid] = prefix + page_route_segments(rel)
+    return routes
 
 
-def resolve_page_links(content, link_map):
-    """Replace `cpage:<id>` placeholders in Markdown with real Collectives URLs."""
+def _relative_route_link(target_route, source_route):
+    """Relative href from a source page to a target page (both route-segment
+    lists). The browser resolves a relative link against the source page's URL
+    with its last segment dropped, so the base is source_route[:-1]; a shared
+    parent prefix cancels out, leaving a collective-agnostic link."""
+    base = "/".join(source_route[:-1]) or "."
+    target = "/".join(target_route) or "."
+    rel = posixpath.relpath(target, base)
+    return "/".join(quote(seg) for seg in rel.split("/"))
+
+
+def resolve_page_links(content, source_route, page_routes, collective_segment):
+    """Replace `cpage:<id>` placeholders with links to other migrated pages.
+
+    Links are RELATIVE to the source page so they survive moving/renaming the
+    collective (the collective is inherited from the current page's URL). The one
+    exception is the collective root/landing page (source_route == []): its URL
+    has no trailing path segment to be relative to, so its links fall back to the
+    absolute '/apps/collectives/<segment>/...' form.
+    """
+    root_source = not source_route
+
     def _sub(m):
-        url = link_map.get(m.group(1))
-        return (url + (m.group(2) or "")) if url else m.group(0)
+        target_route = page_routes.get(m.group(1))
+        if target_route is None:
+            return m.group(0)  # target not migrated — leave the placeholder's link alone
+        anchor = m.group(2) or ""
+        if root_source:
+            href = "/apps/collectives/" + "/".join(
+                quote(s) for s in [collective_segment, *target_route])
+        else:
+            href = _relative_route_link(target_route, source_route)
+        return href + anchor
+
     return CPAGE_LINK_RE.sub(_sub, content)
 
 
@@ -1314,7 +1342,9 @@ def convert(exclude_images, exclude_attachments, dry_run, debug, log_file):
 
 @cli.command()
 @add_options(COMMON_OPTIONS)
-@click.option("--target-parent", default="MigratedPages", help="Parent page in Collectives.")
+@click.option("--target-parent", default="MigratedPages",
+              help="Top folder in the collective. Use '' to import at the collective "
+                   "base (the space homepage becomes the landing page).")
 def upload(target_parent, dry_run, debug, log_file):
     """Upload converted files to Nextcloud Collectives."""
     setup_logging(debug, log_file)
@@ -1395,7 +1425,9 @@ def upload(target_parent, dry_run, debug, log_file):
             log.error("Failed to upload attachment %s: %s", remote_path, e)
 
     # Pass 2: Patch markdown with file-ID links + internal page links, then upload
-    page_link_map = build_page_link_map(state, target_parent, nc.collective_segment)
+    page_routes = build_page_routes(state, target_parent)
+    id_by_path = {Path(rec["convert_path"]): pid
+                  for pid, rec in state.pages.items() if rec.get("convert_path")}
     uploaded_pages = set()
     for local_file in md_files:
         relative = local_file.relative_to(convert_base)
@@ -1406,8 +1438,9 @@ def upload(target_parent, dry_run, debug, log_file):
         try:
             content = local_file.read_text(encoding="utf-8")
 
-            # Resolve internal page-link placeholders to Collectives page URLs
-            content = resolve_page_links(content, page_link_map)
+            # Resolve internal page-link placeholders (relative to this page)
+            source_route = page_routes.get(id_by_path.get(local_file), [])
+            content = resolve_page_links(content, source_route, page_routes, nc.collective_segment)
 
             # Replace attachment links with absolute Nextcloud file URLs
             dir_urls = attachment_urls.get(full_remote_dir, {})
@@ -1464,7 +1497,9 @@ def upload(target_parent, dry_run, debug, log_file):
 @add_options(COMMON_OPTIONS)
 @add_options(SCOPE_OPTIONS)
 @add_options(ATTACHMENT_OPTIONS)
-@click.option("--target-parent", default="MigratedPages", help="Parent page in Collectives.")
+@click.option("--target-parent", default="MigratedPages",
+              help="Top folder in the collective. Use '' to import at the collective "
+                   "base (the space homepage becomes the landing page).")
 def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
             target_parent, dry_run, debug, log_file):
     """Run full migration pipeline: export → convert → upload."""
@@ -1709,7 +1744,7 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
     nc.mkdir_p(target_parent)
 
     converted = state.get_pages_by_status("converted")
-    page_link_map = build_page_link_map(state, target_parent, nc.collective_segment)
+    page_routes = build_page_routes(state, target_parent)
     for pid, page_rec in converted.items():
         sk = page_rec.get("space_key", "default")
         convert_base = Path("convert_data") / sk
@@ -1728,8 +1763,9 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
             nc.mkdir_p(f"{target_parent}/{parent_dirs}")
 
         try:
-            # Resolve internal page-link placeholders, then upload patched content
-            content = resolve_page_links(convert_file.read_text(encoding="utf-8"), page_link_map)
+            # Resolve internal page-link placeholders (relative to this page)
+            content = resolve_page_links(convert_file.read_text(encoding="utf-8"),
+                                         page_routes.get(pid, []), page_routes, nc.collective_segment)
             with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False,
                                              encoding="utf-8") as tmp:
                 tmp.write(content)

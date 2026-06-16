@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from migrate import Converter
+from migrate import Converter, resolve_page_links
 
 
 @pytest.fixture
@@ -280,23 +280,43 @@ class TestResolvePageLinks:
         assert page_route_segments("Drafts/Proc/Readme.md") == ["Drafts", "Proc"]
         assert page_route_segments("Readme.md") == []
 
-    def test_build_map_and_resolve(self, tmp_path):
-        from migrate import MigrationState, build_page_link_map, resolve_page_links
+    def test_build_routes_with_and_without_top_folder(self, tmp_path):
+        from migrate import MigrationState, build_page_routes
         state = MigrationState(path=tmp_path / ".migration-state.json")
-        state.set_page("67890", {
-            "page_id": "67890", "space_key": "TEAM", "status": "converted",
-            "convert_path": str(Path("convert_data/TEAM/Section/Other Page.md")),
-        })
-        link_map = build_page_link_map(state, "MigratedPages", "My Collective")
-        # Title-path URL under collective + target parent, segments encoded
-        assert link_map["67890"] == \
-            "/apps/collectives/My%20Collective/MigratedPages/Section/Other%20Page"
+        state.set_page("1", {"page_id": "1", "space_key": "TEAM", "status": "converted",
+                             "convert_path": str(Path("convert_data/TEAM/Section/Other Page.md"))})
+        state.set_page("2", {"page_id": "2", "space_key": "TEAM", "status": "converted",
+                             "convert_path": str(Path("convert_data/TEAM/Readme.md"))})
+        with_top = build_page_routes(state, "Top")
+        assert with_top["1"] == ["Top", "Section", "Other Page"]
+        assert with_top["2"] == ["Top"]            # homepage sits under the wrapper
+        base = build_page_routes(state, "")
+        assert base["1"] == ["Section", "Other Page"]
+        assert base["2"] == []                      # homepage IS the collective root
 
-        md = "see [X](<cpage:67890>) and [Y](<cpage:67890#Heading>) and [Z](<cpage:55>)"
-        out = resolve_page_links(md, link_map)
-        assert "/apps/collectives/My%20Collective/MigratedPages/Section/Other%20Page>" in out
-        assert "Section/Other%20Page#Heading>" in out
-        assert "cpage:55" in out  # unmapped placeholder left as-is
+    def test_relative_route_link(self):
+        from migrate import _relative_route_link
+        # leaf -> sibling leaf
+        assert _relative_route_link(["A", "B", "D"], ["A", "B", "C"]) == "D"
+        # folder/parent page (route A/B) -> its child D
+        assert _relative_route_link(["A", "B", "D"], ["A", "B"]) == "B/D"
+        # any page -> the collective root (homepage)
+        assert _relative_route_link([], ["A", "B"]) == ".."
+        # segments are URL-encoded
+        assert _relative_route_link(["Other Page"], ["Sub", "Leaf"]) == "../Other%20Page"
+
+    def test_resolve_relative_from_normal_page(self):
+        routes = {"1": ["Sec", "Other"], "2": ["Sec", "Cur"]}
+        md = "see [X](<cpage:1>) and [Y](<cpage:1#H>) and [Z](<cpage:99>)"
+        out = resolve_page_links(md, ["Sec", "Cur"], routes, "Coll-9")
+        assert "[X](<Other>)" in out              # relative, collective-agnostic
+        assert "Other#H" in out                   # anchor preserved
+        assert "cpage:99" in out                  # unmigrated target left as-is
+
+    def test_resolve_absolute_from_root_homepage(self):
+        # The collective root page (source_route == []) can't be relative.
+        out = resolve_page_links("[X](<cpage:1>)", [], {"1": ["Vorgabe", "Glossar"]}, "Coll-9")
+        assert "/apps/collectives/Coll-9/Vorgabe/Glossar" in out
 
 
 class TestConvertPage:
