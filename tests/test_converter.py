@@ -98,11 +98,14 @@ class TestPreprocessImageUrls:
 class TestPreprocessPanels:
     def test_info_panel(self, converter):
         html = '''<div class="confluence-information-macro confluence-information-macro-information">
+            <span class="aui-icon confluence-information-macro-icon"></span>
             <div class="confluence-information-macro-body"><p>Info text</p></div>
         </div>'''
         result = converter.preprocess_html(html)
         assert "<blockquote>" in result
-        assert "Info" in result
+        assert "Info text" in result
+        # No duplicate type label is prepended (the body often self-labels)
+        assert "Info:" not in result
 
     def test_warning_panel(self, converter):
         html = '''<div class="confluence-information-macro confluence-information-macro-warning">
@@ -110,7 +113,8 @@ class TestPreprocessPanels:
         </div>'''
         result = converter.preprocess_html(html)
         assert "<blockquote>" in result
-        assert "Warning" in result
+        assert "Danger!" in result
+        assert "Warning:" not in result
 
     def test_note_panel(self, converter):
         html = '''<div class="confluence-information-macro confluence-information-macro-note">
@@ -118,6 +122,7 @@ class TestPreprocessPanels:
         </div>'''
         result = converter.preprocess_html(html)
         assert "<blockquote>" in result
+        assert "Remember this." in result
 
     def test_tip_panel(self, converter):
         html = '''<div class="confluence-information-macro confluence-information-macro-tip">
@@ -125,7 +130,7 @@ class TestPreprocessPanels:
         </div>'''
         result = converter.preprocess_html(html)
         assert "<blockquote>" in result
-        assert "Tip" in result
+        assert "Pro tip!" in result
 
 
 class TestPreprocessCodeBlocks:

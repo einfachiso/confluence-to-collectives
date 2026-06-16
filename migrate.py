@@ -426,25 +426,14 @@ class Converter:
                     if parts:
                         cell.insert(0, " — ".join(parts))
 
-        # Info / warning / note panels → blockquotes
+        # Info / warning / note panels → blockquotes. No "Info:"/"Note:" label is
+        # prepended: Collectives renders the blockquote distinctly, and Confluence
+        # panel bodies frequently already start with their own label, so a prefix
+        # just duplicates it.
         for panel in soup.find_all("div", class_=re.compile(r"(confluence-information-macro)")):
-            macro_type = "Note"
-            classes = panel.get("class", [])
-            for cls in classes:
-                if "note" in cls:
-                    macro_type = "Note"
-                elif "warning" in cls:
-                    macro_type = "Warning"
-                elif "tip" in cls:
-                    macro_type = "Tip"
-                elif "info" in cls:
-                    macro_type = "Info"
             body = panel.find("div", class_="confluence-information-macro-body")
             if body:
                 bq = soup.new_tag("blockquote")
-                prefix = soup.new_tag("strong")
-                prefix.string = f"{macro_type}: "
-                bq.append(prefix)
                 for child in list(body.children):
                     bq.append(child.extract() if isinstance(child, Tag) else child)
                 panel.replace_with(bq)
@@ -1368,7 +1357,7 @@ def upload(target_parent, dry_run, debug, log_file):
                 def _replace_link(m):
                     label, href = m.group(1), m.group(2)
                     if href in dir_urls:
-                        return f"[{label}]({dir_urls[href]})"
+                        return f"- [{label}]({dir_urls[href]})"  # keep the list bullet
                     return m.group(0)
 
                 content = re.sub(
