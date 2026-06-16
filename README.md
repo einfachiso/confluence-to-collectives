@@ -7,10 +7,24 @@ CLI tool to migrate pages and attachments from Confluence Cloud to Nextcloud Col
 The tool runs a three-phase pipeline:
 
 1. **Export** — Fetches pages via the Confluence Cloud REST API v2 (`body-format=export_view` for clean HTML), downloads attachments, and stores everything locally in `export_data/`.
-2. **Convert** — Transforms Confluence HTML to Markdown using BeautifulSoup (preprocessing) + html2text (conversion). Builds the output directory tree matching page hierarchy. Copies attachments alongside their pages.
-3. **Upload** — Pushes the converted Markdown files and attachments to Nextcloud Collectives via WebDAV (`MKCOL` for directories, `PUT` for files).
+2. **Convert** — Transforms Confluence HTML to Markdown using BeautifulSoup (preprocessing) + html2text (conversion). Builds the output directory tree matching page hierarchy. Copies attachments alongside their pages. Links to other migrated pages are tagged with a `cpage:<id>` placeholder for the upload phase to resolve, and diagram/image macro previews are lifted out so they render as static images.
+3. **Upload** — Resolves the target collective via the Collectives OCS API, then pushes the converted Markdown files and attachments to Nextcloud Collectives via WebDAV (`MKCOL` for directories, `PUT` for files). The `cpage:` placeholders are resolved per source page into **relative** links between the output pages, so they survive renaming the collective or moving its pages.
 
 Each phase tracks per-page status in `.migration-state.json`, enabling resumable migrations and independent re-runs of any phase.
+
+### Internal Links & Diagrams
+
+- **Internal page links** between migrated pages are preserved as relative links between the output pages. Relative links are collective-agnostic, so they keep working if the collective is renamed or its pages are moved to another collective. The collective's root/landing page is the one exception (it has no trailing URL segment to be relative to), and uses an absolute `/apps/collectives/<slug>-<id>/...` link instead.
+- **Diagrams and images** from draw.io / Gliffy / etc. macros render as static images: the macro's rendered `<img>` preview (embedded by `export_view`) is lifted out before the macro itself is dropped. SVG previews stay demoted to an attachment link, since Collectives blocks SVG rendering.
+
+### Modern / Localized / Shared Collectives
+
+`verify_connection` resolves the target collective via the Collectives OCS API, matching `NEXTCLOUD_COLLECTIVE` by display name, slug, or `<slug>-<id>`. This handles:
+
+- The hidden, **localized** storage folder — a German Nextcloud stores collectives under `.Kollektive` rather than `.Collectives` (read from a page's `collectivePath`).
+- The WebDAV folder being the collective's display name, while the link URL segment is `<slug>-<id>`.
+
+If the OCS API is unavailable, it falls back to probing `.Collectives` then `Collectives`. Attachment links use the open-by-id `.../f/<id>` URL so they resolve even from the hidden storage folder.
 
 ### Page Hierarchy Mapping
 
@@ -105,6 +119,9 @@ python migrate.py migrate --space SPACE_KEY --exclude-attachments
 
 # Specify target parent page in Collectives
 python migrate.py migrate --space SPACE_KEY --target-parent "Imported from Confluence"
+
+# Import directly at the collective base (space homepage becomes the landing page)
+python migrate.py migrate --space SPACE_KEY --target-parent ''
 ```
 
 ### Individual Phases
@@ -134,7 +151,7 @@ python migrate.py status
 | `--all-spaces` | export, migrate | Migrate all accessible spaces |
 | `--exclude-images` | export, convert, migrate | Skip image attachments |
 | `--exclude-attachments` | export, convert, migrate | Skip all attachments |
-| `--target-parent NAME` | upload, migrate | Parent page in Collectives (default: `MigratedPages`) |
+| `--target-parent NAME` | upload, migrate | Top folder in the collective (default: `MigratedPages`). Use `''` to import at the collective base — the space homepage becomes the landing page |
 | `--dry-run` | all | Preview actions without changes |
 | `--debug` | all | Enable debug logging |
 | `--log-file PATH` | all | Write logs to file |
@@ -164,12 +181,14 @@ convert_data/{space_key}/         # Phase 2 output (uploaded in Phase 3)
 | Page body | Clean Markdown |
 | Tables (even with headings in cells) | Markdown tables |
 | Images | `![alt](image.png)` with relative paths |
+| Diagram macros (Draw.io, Gliffy, etc.) | Rendered preview lifted out as a static `![](…)` image |
+| Internal page links | Relative links between the migrated pages (move/rename-safe) |
 | Code blocks | Fenced code blocks with language hints |
-| Info/warning/note/tip panels | Blockquotes with bold prefix |
+| Info/warning/note/tip panels | Plain blockquotes (no duplicated `Info:`/`Note:` label) |
 | User mentions | `@DisplayName` |
 | Footer comments | `## Comments` section with author and date |
-| Non-image attachments | `## Attachments` section with links |
-| Unsupported macros (Jira, Draw.io, etc.) | HTML comment: `<!-- Unsupported macro: name -->` |
+| Non-image attachments | `## Attachments` section with `-` bulleted links |
+| Other unsupported macros (Jira, etc.) | HTML comment: `<!-- Unsupported macro: name -->` |
 | Attachment management UI | Removed (tool generates its own section) |
 
 ## Limitations
@@ -177,7 +196,7 @@ convert_data/{space_key}/         # Phase 2 output (uploaded in Phase 3)
 - **Confluence Cloud only** — Confluence Server/Data Center API differences are not handled.
 - **Footer comments only** — Inline comments (annotations on specific text) are not migrated; footer comments and their reply chains are fully supported.
 - **No permission migration** — Page-level permissions from Confluence are not transferred.
-- **Unsupported macros** — Jira, Draw.io, and other third-party macro content is replaced with HTML comments.
+- **Unsupported macros** — Diagram macros (Draw.io, Gliffy, etc.) render via their static image preview, but other third-party macro content (e.g. Jira) is replaced with HTML comments. SVG diagram previews are demoted to attachment links, since Collectives blocks SVG rendering.
 - **Sequential processing** — Pages are processed one at a time (no parallel downloads).
 - **Filename length** — Titles are capped at 200 characters; special characters are stripped.
 
@@ -217,6 +236,15 @@ The `.mcp.json` file configures two MCP servers for development and testing:
 These are development tools only — `migrate.py` has zero MCP dependency and uses direct HTTP requests.
 
 ## Changelog
+
+### Unreleased
+
+- Internal page links between migrated pages are preserved as relative links (survive renaming the collective or moving its pages); the collective's landing page uses an absolute `/apps/collectives/<slug>-<id>/...` link
+- Diagram macros (Draw.io, Gliffy, etc.) now render as static images — the rendered preview is lifted out of the macro instead of being dropped
+- Resolve the target collective via the Collectives OCS API: supports modern/localized/shared collectives (e.g. a German Nextcloud's `.Kollektive` storage folder), matches by name / slug / `<slug>-<id>`, and falls back to probing `.Collectives`/`Collectives`
+- Attachment links use the open-by-id `.../f/<id>` URL so they resolve even from the hidden storage folder
+- `--target-parent ''` imports directly at the collective base (the space homepage becomes the landing page) instead of nesting under a top folder
+- Fix: attachment list `-` bullets are preserved; Info/Warning/Note/Tip panels become plain blockquotes without a duplicated `Info:`/`Note:` label
 
 ### 0.6.0
 
