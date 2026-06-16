@@ -333,9 +333,13 @@ class Converter:
     #   https://x.atlassian.net/wiki/spaces/TEAM/pages/67890
     PAGE_LINK_RE = re.compile(r"/pages/(\d+)")
 
-    def __init__(self, exclude_images=False, exclude_attachments=False):
+    def __init__(self, exclude_images=False, exclude_attachments=False, strip_patterns=None):
         self.exclude_images = exclude_images
         self.exclude_attachments = exclude_attachments
+        # Text substrings; any block (table/div/etc.) whose text contains one is
+        # removed during preprocessing. Used to drop boilerplate such as a
+        # per-page copyright box. Configured via STRIP_CONTENT_PATTERNS.
+        self.strip_patterns = [p for p in (strip_patterns or []) if p]
         # page_id -> output path relative to the space root (e.g. "Section/Leaf.md").
         # Populated via set_link_map() so internal page links can be rewritten to
         # relative links between the migrated Markdown files.
@@ -357,6 +361,9 @@ class Converter:
         space root); enables internal-link rewriting when a link map is set.
         """
         soup = BeautifulSoup(html, "html.parser")
+
+        # Drop configured boilerplate blocks (e.g. a per-page copyright box)
+        self._strip_configured_content(soup)
 
         # Remove leading <hr> tags — html2text converts them to "---" which
         # Nextcloud Collectives misinterprets as YAML front matter
@@ -499,6 +506,29 @@ class Converter:
             self._rewrite_internal_links(soup, current_path)
 
         return str(soup)
+
+    def _strip_configured_content(self, soup):
+        """Remove blocks whose text contains a configured strip pattern.
+
+        Targets the nearest enclosing table (incl. its `table-wrap` div) — or, if
+        not in a table, the nearest block element — so e.g. a per-page copyright
+        box (a one-cell table) is dropped wholesale. Customer-specific patterns
+        live in config, never in code.
+        """
+        if not self.strip_patterns:
+            return
+        removed = set()
+        for pattern in self.strip_patterns:
+            for node in soup.find_all(string=lambda s, p=pattern: s and p in s):
+                block = node.find_parent("table") or node.find_parent(
+                    ["blockquote", "div", "p", "li"])
+                if block is None:
+                    continue
+                target = block.find_parent("div", class_="table-wrap") or block
+                if id(target) in removed:
+                    continue
+                removed.add(id(target))
+                target.decompose()
 
     def _replace_unsupported_macro(self, soup, macro, name):
         """Drop an unsupported macro, but lift out any rendered <img> it wraps.
@@ -917,6 +947,12 @@ class NextcloudClient:
 # ---------------------------------------------------------------------------
 
 
+def strip_patterns_from_env():
+    """Content-strip patterns from STRIP_CONTENT_PATTERNS (||| separated)."""
+    raw = os.getenv("STRIP_CONTENT_PATTERNS", "")
+    return [p.strip() for p in raw.split("|||") if p.strip()]
+
+
 def require_env(*keys):
     """Validate required environment variables are set."""
     missing = [k for k in keys if not os.getenv(k)]
@@ -1269,7 +1305,8 @@ def convert(exclude_images, exclude_attachments, dry_run, debug, log_file):
         click.echo("No exported pages to convert. Run 'export' first.")
         sys.exit(EXIT_SUCCESS)
 
-    converter = Converter(exclude_images=exclude_images, exclude_attachments=exclude_attachments)
+    converter = Converter(exclude_images=exclude_images, exclude_attachments=exclude_attachments,
+                          strip_patterns=strip_patterns_from_env())
     tree = converter.build_output_tree(state)
     converter.set_link_map({pid: info["path"] for pid, info in tree.items()})
 
@@ -1676,7 +1713,8 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
     click.echo("Phase 2: Convert")
     click.echo("=" * 60)
 
-    converter = Converter(exclude_images=exclude_images, exclude_attachments=exclude_attachments)
+    converter = Converter(exclude_images=exclude_images, exclude_attachments=exclude_attachments,
+                          strip_patterns=strip_patterns_from_env())
     exported = state.get_pages_by_status("exported")
     tree = converter.build_output_tree(state)
     converter.set_link_map({pid: info["path"] for pid, info in tree.items()})

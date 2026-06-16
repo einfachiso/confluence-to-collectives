@@ -59,6 +59,31 @@ class TestPreprocessTableHeaders:
         assert "<strong>" in result
 
 
+class TestStripConfiguredContent:
+    def test_removes_table_with_pattern(self):
+        c = Converter(strip_patterns=["CONFIDENTIAL"])
+        html = ('<p>Keep me</p>'
+                '<div class="table-wrap"><table><tr><td>'
+                '<p>This is CONFIDENTIAL boilerplate</p></td></tr></table></div>'
+                '<p>Keep me too</p>')
+        result = c.preprocess_html(html)
+        assert "CONFIDENTIAL" not in result
+        assert "<table" not in result
+        assert "Keep me" in result and "Keep me too" in result
+
+    def test_removes_non_table_block(self):
+        c = Converter(strip_patterns=["REMOVE"])
+        html = '<p>Stay</p><div><p>REMOVE this block</p></div><p>Stay2</p>'
+        result = c.preprocess_html(html)
+        assert "REMOVE" not in result
+        assert "Stay" in result and "Stay2" in result
+
+    def test_no_patterns_keeps_everything(self):
+        c = Converter()
+        html = '<table><tr><td>Copyright box</td></tr></table>'
+        assert "Copyright box" in c.preprocess_html(html)
+
+
 class TestPreprocessAttachmentContainer:
     def test_remove_plugin_attachments_container(self, converter):
         html = '<p>Content</p><div class="plugin_attachments_container"><h2>Attachments</h2></div>'
