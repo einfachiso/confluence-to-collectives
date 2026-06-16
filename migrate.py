@@ -6,6 +6,7 @@ __version__ = "0.6.0"
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import sys
@@ -294,12 +295,27 @@ class ConfluenceClient:
     def get_page_attachments(self, page_id):
         return list(self._paginate(f"/wiki/api/v2/pages/{page_id}/attachments"))
 
-    def download_attachment(self, download_url):
-        """Download attachment binary. Prepends /wiki to relative URLs."""
-        if download_url.startswith("/download/") or download_url.startswith("/rest/"):
-            download_url = f"/wiki{download_url}"
-        resp = self._request("GET", download_url)
-        return resp.content
+    def download_attachment(self, content_id, attachment_id, fallback_url=None):
+        """Download an attachment binary.
+
+        Uses the REST route /wiki/rest/api/content/{id}/child/attachment/{attId}/download,
+        which honours API-token Basic auth and 302-redirects to the media binary.
+        The attachment's own `downloadLink` instead points at the legacy
+        /wiki/download servlet, which rejects API tokens (HTTP 401 + "OAuth"
+        challenge) on Cloud sites — so it is only used as a last-resort fallback.
+        """
+        try:
+            url = (
+                f"/wiki/rest/api/content/{content_id}"
+                f"/child/attachment/{attachment_id}/download"
+            )
+            return self._request("GET", url).content
+        except requests.HTTPError:
+            if fallback_url:
+                if fallback_url.startswith("/download/") or fallback_url.startswith("/rest/"):
+                    fallback_url = f"/wiki{fallback_url}"
+                return self._request("GET", fallback_url).content
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -312,9 +328,18 @@ class Converter:
 
     UNSAFE_FILENAME_RE = re.compile(r'[/\\:*?"<>|]')
 
+    # Matches a Confluence page id in an internal link, e.g.
+    #   /wiki/spaces/TEAM/pages/67890/Other+Page
+    #   https://x.atlassian.net/wiki/spaces/TEAM/pages/67890
+    PAGE_LINK_RE = re.compile(r"/pages/(\d+)")
+
     def __init__(self, exclude_images=False, exclude_attachments=False):
         self.exclude_images = exclude_images
         self.exclude_attachments = exclude_attachments
+        # page_id -> output path relative to the space root (e.g. "Section/Leaf.md").
+        # Populated via set_link_map() so internal page links can be rewritten to
+        # relative links between the migrated Markdown files.
+        self.page_link_map = {}
         self._h2t = html2text.HTML2Text()
         self._h2t.body_width = 0
         self._h2t.protect_links = True
@@ -325,8 +350,12 @@ class Converter:
 
     # -- preprocessing ----------------------------------------------------
 
-    def preprocess_html(self, html, attachment_names=None):
-        """Clean Confluence HTML before markdown conversion."""
+    def preprocess_html(self, html, attachment_names=None, current_path=None):
+        """Clean Confluence HTML before markdown conversion.
+
+        current_path: output path of the page being converted (relative to the
+        space root); enables internal-link rewriting when a link map is set.
+        """
         soup = BeautifulSoup(html, "html.parser")
 
         # Remove leading <hr> tags — html2text converts them to "---" which
@@ -431,10 +460,12 @@ class Converter:
                 new_pre.append(code_tag)
                 code_macro.replace_with(new_pre)
 
-        # ac:structured-macro and data-macro-name → HTML comments
+        # ac:structured-macro and data-macro-name → HTML comments, BUT keep any
+        # rendered image inside (draw.io / Gliffy / etc. embed a PNG preview in
+        # export_view) so diagrams still show up in Collectives.
         for macro in soup.find_all("ac:structured-macro"):
             name = macro.get("ac:name", "unknown")
-            macro.replace_with(Comment(f" Unsupported macro: {name} "))
+            self._replace_unsupported_macro(soup, macro, name)
 
         for macro in soup.find_all("div", attrs={"data-macro-name": True}):
             # Skip already-handled panels and code blocks
@@ -444,7 +475,7 @@ class Converter:
             ):
                 continue
             name = macro.get("data-macro-name", "unknown")
-            macro.replace_with(Comment(f" Unsupported macro: {name} "))
+            self._replace_unsupported_macro(soup, macro, name)
 
         # User mentions → @DisplayName
         for mention in soup.find_all("a", class_="confluence-userlink"):
@@ -472,19 +503,71 @@ class Converter:
             for img in soup.find_all("img"):
                 img.decompose()
 
+        # Rewrite internal page-to-page links to relative Markdown links so they
+        # keep working inside Collectives (no-op unless a link map + current path
+        # are supplied via set_link_map() / convert_page(current_page_id=...)).
+        if self.page_link_map and current_path is not None:
+            self._rewrite_internal_links(soup, current_path)
+
         return str(soup)
 
+    def _replace_unsupported_macro(self, soup, macro, name):
+        """Drop an unsupported macro, but lift out any rendered <img> it wraps.
+
+        Confluence renders draw.io/Gliffy/etc. macros to a PNG preview inside the
+        macro element in export_view. Keeping that image lets the diagram render
+        in Collectives; the later image-src rewrite turns it into a local file
+        reference. Macros with no image become an HTML comment as before.
+        """
+        imgs = macro.find_all("img")
+        if imgs:
+            wrapper = soup.new_tag("p")
+            for img in imgs:
+                wrapper.append(img.extract())
+            macro.replace_with(wrapper)
+        else:
+            macro.replace_with(Comment(f" Unsupported macro: {name} "))
+
+    def _rewrite_internal_links(self, soup, current_path):
+        """Rewrite <a> links targeting migrated Confluence pages to relative
+        links between the output Markdown files. Links to pages outside the
+        migrated set (or non-page links) are left untouched."""
+        current_dir = posixpath.dirname(current_path)
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            m = self.PAGE_LINK_RE.search(href)
+            if not m:
+                continue
+            target_path = self.page_link_map.get(m.group(1))
+            if not target_path:
+                continue  # target page not part of this migration — leave as-is
+            anchor = ""
+            if "#" in href:
+                anchor = "#" + href.split("#", 1)[1]
+            rel = posixpath.relpath(target_path, current_dir or ".")
+            rel = "/".join(quote(seg) for seg in rel.split("/"))
+            a["href"] = rel + anchor
+
     # -- conversion -------------------------------------------------------
+
+    def set_link_map(self, page_link_map):
+        """Provide {page_id: output_path} so internal links can be rewritten."""
+        self.page_link_map = page_link_map or {}
 
     def html_to_markdown(self, html):
         """Convert HTML to markdown via html2text."""
         return self._h2t.handle(html).strip()
 
-    def convert_page(self, page_data, attachments_dir=None):
-        """Full page conversion: preprocess → markdown → comments → attachments."""
+    def convert_page(self, page_data, attachments_dir=None, current_page_id=None):
+        """Full page conversion: preprocess → markdown → comments → attachments.
+
+        current_page_id: the Confluence page id being converted; used with the
+        link map to rewrite internal page links relative to this page.
+        """
         html = page_data.get("body", "")
         attachment_names = [a["title"] for a in page_data.get("attachments", [])]
-        processed = self.preprocess_html(html, attachment_names)
+        current_path = self.page_link_map.get(str(current_page_id)) if current_page_id else None
+        processed = self.preprocess_html(html, attachment_names, current_path=current_path)
         md = self.html_to_markdown(processed)
 
         # Append comments
@@ -666,32 +749,63 @@ class Converter:
 class NextcloudClient:
     """Nextcloud WebDAV client for Collectives."""
 
+    # Collectives stores pages in a folder inside the user's files. Recent
+    # versions (Collectives 4.x / Nextcloud 28+) use the HIDDEN ".Collectives";
+    # older versions used "Collectives". Probed in verify_connection().
+    COLLECTIVES_DIRS = (".Collectives", "Collectives")
+
     def __init__(self, base_url, username, password, collective):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.collective = collective
-        self.dav_base = f"{self.base_url}/remote.php/dav/files/{username}/Collectives/{collective}"
+        self.files_base = f"{self.base_url}/remote.php/dav/files/{username}"
+        # Default to the modern hidden folder; verify_connection() may switch to
+        # the legacy name if that is what the server actually exposes.
+        self.collectives_dir = self.COLLECTIVES_DIRS[0]
         self.session = requests.Session()
         self.session.auth = (username, password)
 
+    @property
+    def dav_base(self):
+        return f"{self.files_base}/{self.collectives_dir}/{self.collective}"
+
     def verify_connection(self):
-        """Verify we can reach the collective via PROPFIND."""
-        resp = self.session.request("PROPFIND", self.dav_base, headers={"Depth": "0"})
-        if resp.status_code == 401:
-            raise click.ClickException("Nextcloud authentication failed — check credentials.")
-        if resp.status_code == 404:
+        """Verify we can reach the collective, auto-detecting the storage folder.
+
+        Tries ".Collectives/<name>" then "Collectives/<name>" so the tool works
+        against both modern and legacy Collectives without configuration.
+        """
+        last_status = None
+        for candidate in self.COLLECTIVES_DIRS:
+            self.collectives_dir = candidate
+            resp = self.session.request("PROPFIND", self.dav_base, headers={"Depth": "0"})
+            if resp.status_code == 401:
+                raise click.ClickException("Nextcloud authentication failed — check credentials.")
+            if resp.status_code in (200, 207):
+                log.info(
+                    "Connected to Nextcloud collective: %s (under %s)",
+                    self.collective, candidate,
+                )
+                return
+            last_status = resp.status_code
+
+        if last_status == 404:
             raise click.ClickException(
-                f"Collective '{self.collective}' not found at {self.dav_base}"
+                f"Collective '{self.collective}' not found under "
+                f"{'/'.join(self.COLLECTIVES_DIRS)} for user {self.username}."
             )
-        if resp.status_code not in (200, 207):
-            raise click.ClickException(
-                f"Nextcloud PROPFIND failed with status {resp.status_code}"
-            )
-        log.info("Connected to Nextcloud collective: %s", self.collective)
+        raise click.ClickException(
+            f"Nextcloud PROPFIND failed with status {last_status}"
+        )
+
+    @staticmethod
+    def _remote(path):
+        """Normalise a remote path for WebDAV URLs (Windows backslashes → '/')."""
+        return path.replace("\\", "/")
 
     def mkdir_p(self, path):
         """Recursively create directories via MKCOL."""
-        parts = path.strip("/").split("/")
+        parts = self._remote(path).strip("/").split("/")
         current = self.dav_base
         for part in parts:
             if not part:
@@ -704,6 +818,7 @@ class NextcloudClient:
     def upload_file(self, local_path, remote_path):
         """Upload a file via PUT."""
         import mimetypes
+        remote_path = self._remote(remote_path)
         url = f"{self.dav_base}/{remote_path.lstrip('/')}"
         content_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
         with open(local_path, "rb") as f:
@@ -718,6 +833,7 @@ class NextcloudClient:
         """Get Nextcloud file ID via PROPFIND."""
         import xml.etree.ElementTree as ET
 
+        remote_path = self._remote(remote_path)
         url = f"{self.dav_base}/{remote_path.lstrip('/')}"
         body = (
             '<?xml version="1.0"?>'
@@ -745,7 +861,7 @@ class NextcloudClient:
 
     def exists(self, path):
         """Check if a remote path exists via PROPFIND depth 0."""
-        url = f"{self.dav_base}/{path.lstrip('/')}"
+        url = f"{self.dav_base}/{self._remote(path).lstrip('/')}"
         resp = self.session.request("PROPFIND", url, headers={"Depth": "0"})
         return resp.status_code in (200, 207)
 
@@ -940,14 +1056,12 @@ def export(space_key, pages, all_spaces, exclude_images, exclude_attachments, dr
                             if exclude_images and ext in image_exts:
                                 continue
 
-                            download_url = att.get("downloadLink", "")
-                            if not download_url:
-                                # Fallback: try _links.download
-                                download_url = att.get("_links", {}).get("download", "")
+                            att_id = att.get("id")
+                            fallback = att.get("downloadLink") or att.get("_links", {}).get("download")
 
-                            if download_url:
+                            if att_id or fallback:
                                 try:
-                                    data = client.download_attachment(download_url)
+                                    data = client.download_attachment(page_id, att_id, fallback_url=fallback)
                                     att_dir.mkdir(parents=True, exist_ok=True)
                                     (att_dir / att_title).write_bytes(data)
                                     attachments.append({
@@ -1033,6 +1147,7 @@ def convert(exclude_images, exclude_attachments, dry_run, debug, log_file):
 
     converter = Converter(exclude_images=exclude_images, exclude_attachments=exclude_attachments)
     tree = converter.build_output_tree(state)
+    converter.set_link_map({pid: info["path"] for pid, info in tree.items()})
 
     if dry_run:
         click.echo(f"\n[DRY RUN] {len(exported)} page(s) to convert:")
@@ -1069,7 +1184,7 @@ def convert(exclude_images, exclude_attachments, dry_run, debug, log_file):
             output_dir = convert_base / path_info["dir"] if path_info["dir"] else convert_base
 
             # Convert to markdown
-            md = converter.convert_page(page_data)
+            md = converter.convert_page(page_data, current_page_id=pid)
 
             # Write markdown
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1158,7 +1273,7 @@ def upload(target_parent, dry_run, debug, log_file):
     # Ensure all parent directories are created
     created_dirs = set()
     for local_file in all_files:
-        parent_dirs = str(local_file.relative_to(convert_base).parent)
+        parent_dirs = local_file.relative_to(convert_base).parent.as_posix()
         if parent_dirs and parent_dirs != "." and parent_dirs not in created_dirs:
             nc.mkdir_p(f"{target_parent}/{parent_dirs}")
             created_dirs.add(parent_dirs)
@@ -1168,13 +1283,13 @@ def upload(target_parent, dry_run, debug, log_file):
     attachment_urls = {}
     for local_file in attachment_files:
         relative = local_file.relative_to(convert_base)
-        remote_path = f"{target_parent}/{relative}"
+        remote_path = f"{target_parent}/{relative.as_posix()}"
         try:
             nc.upload_file(str(local_file), remote_path)
             log.info("Uploaded attachment: %s", remote_path)
             file_id = nc.get_file_id(remote_path)
             if file_id:
-                remote_dir = str(relative.parent) if str(relative.parent) != "." else ""
+                remote_dir = relative.parent.as_posix() if str(relative.parent) != "." else ""
                 full_remote_dir = f"{target_parent}/{remote_dir}".rstrip("/")
                 encoded_name = quote(local_file.name)
                 attachment_urls.setdefault(full_remote_dir, {})[encoded_name] = \
@@ -1187,8 +1302,8 @@ def upload(target_parent, dry_run, debug, log_file):
     uploaded_pages = set()
     for local_file in md_files:
         relative = local_file.relative_to(convert_base)
-        remote_path = f"{target_parent}/{relative}"
-        remote_dir = str(relative.parent) if str(relative.parent) != "." else ""
+        remote_path = f"{target_parent}/{relative.as_posix()}"
+        remote_dir = relative.parent.as_posix() if str(relative.parent) != "." else ""
         full_remote_dir = f"{target_parent}/{remote_dir}".rstrip("/")
 
         try:
@@ -1365,12 +1480,11 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
                             ext = Path(att_title).suffix.lower()
                             if exclude_images and ext in image_exts:
                                 continue
-                            download_url = att.get("downloadLink", "")
-                            if not download_url:
-                                download_url = att.get("_links", {}).get("download", "")
-                            if download_url:
+                            att_id = att.get("id")
+                            fallback = att.get("downloadLink") or att.get("_links", {}).get("download")
+                            if att_id or fallback:
                                 try:
-                                    data = conf_client.download_attachment(download_url)
+                                    data = conf_client.download_attachment(page_id, att_id, fallback_url=fallback)
                                     att_dir.mkdir(parents=True, exist_ok=True)
                                     (att_dir / att_title).write_bytes(data)
                                     attachments.append({"title": att_title, "size": len(data), "mediaType": att.get("mediaType", "")})
@@ -1430,6 +1544,7 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
     converter = Converter(exclude_images=exclude_images, exclude_attachments=exclude_attachments)
     exported = state.get_pages_by_status("exported")
     tree = converter.build_output_tree(state)
+    converter.set_link_map({pid: info["path"] for pid, info in tree.items()})
 
     for pid, page_rec in exported.items():
         title = page_rec.get("title", "?")
@@ -1451,7 +1566,7 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
             output_path = convert_base / path_info["path"]
             output_dir = convert_base / path_info["dir"] if path_info["dir"] else convert_base
 
-            md = converter.convert_page(page_data)
+            md = converter.convert_page(page_data, current_page_id=pid)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(md, encoding="utf-8")
 
@@ -1505,9 +1620,9 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
 
         convert_file = Path(convert_path)
         relative = convert_file.relative_to(convert_base)
-        remote_path = f"{target_parent}/{relative}"
+        remote_path = f"{target_parent}/{relative.as_posix()}"
 
-        parent_dirs = str(relative.parent)
+        parent_dirs = relative.parent.as_posix()
         if parent_dirs and parent_dirs != ".":
             nc.mkdir_p(f"{target_parent}/{parent_dirs}")
 
@@ -1519,7 +1634,7 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
             for f in output_dir.iterdir():
                 if f.is_file() and f != convert_file and f.suffix != ".md":
                     f_relative = f.relative_to(convert_base)
-                    f_remote = f"{target_parent}/{f_relative}"
+                    f_remote = f"{target_parent}/{f_relative.as_posix()}"
                     nc.upload_file(str(f), f_remote)
                     log.debug("Uploaded attachment: %s", f_remote)
 

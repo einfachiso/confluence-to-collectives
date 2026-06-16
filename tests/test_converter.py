@@ -190,6 +190,90 @@ class TestHtmlToMarkdown:
         assert len(lines) == 1
 
 
+class TestPreserveDiagramImages:
+    """draw.io / Gliffy etc. render a PNG preview inside the macro in
+    export_view; that image must survive instead of being dropped."""
+
+    def test_drawio_image_preserved(self, converter):
+        html = (
+            '<div data-macro-name="drawio">'
+            '<img src="/download/attachments/12345/architecture.png?version=2" />'
+            '</div>'
+        )
+        result = converter.preprocess_html(html)
+        assert 'src="architecture.png"' in result
+        assert "Unsupported macro" not in result
+
+    def test_structured_macro_image_preserved(self, converter):
+        html = (
+            '<ac:structured-macro ac:name="drawio">'
+            '<img src="/download/attachments/1/flow.png" />'
+            '</ac:structured-macro>'
+        )
+        result = converter.preprocess_html(html)
+        assert 'src="flow.png"' in result
+        assert "Unsupported macro" not in result
+
+    def test_macro_without_image_still_becomes_comment(self, converter):
+        html = '<div data-macro-name="drawio"><p>diagram</p></div>'
+        result = converter.preprocess_html(html)
+        assert "Unsupported macro: drawio" in result
+
+
+class TestRewriteInternalLinks:
+    LINK_MAP = {
+        "67890": "Section/Other Page.md",
+        "111": "Readme.md",
+    }
+
+    def test_link_rewritten_relative_from_root(self, converter):
+        converter.set_link_map(self.LINK_MAP)
+        html = '<p>See <a href="/wiki/spaces/TEAM/pages/67890/Other+Page">Other Page</a></p>'
+        result = converter.preprocess_html(html, current_path="Readme.md")
+        # From root, target Section/Other Page.md -> "Section/Other%20Page.md"
+        assert 'href="Section/Other%20Page.md"' in result
+
+    def test_link_rewritten_relative_between_subdirs(self, converter):
+        converter.set_link_map(self.LINK_MAP)
+        html = '<a href="/wiki/spaces/TEAM/pages/111/Home">Home</a>'
+        result = converter.preprocess_html(html, current_path="Section/Leaf.md")
+        # From Section/, target Readme.md at root -> "../Readme.md"
+        assert 'href="../Readme.md"' in result
+
+    def test_anchor_preserved(self, converter):
+        converter.set_link_map(self.LINK_MAP)
+        html = '<a href="/wiki/spaces/TEAM/pages/67890/Other+Page#Heading">x</a>'
+        result = converter.preprocess_html(html, current_path="Readme.md")
+        assert 'href="Section/Other%20Page.md#Heading"' in result
+
+    def test_link_to_unmigrated_page_untouched(self, converter):
+        converter.set_link_map(self.LINK_MAP)
+        html = '<a href="/wiki/spaces/TEAM/pages/99999/Gone">x</a>'
+        result = converter.preprocess_html(html, current_path="Readme.md")
+        assert "/wiki/spaces/TEAM/pages/99999/Gone" in result
+
+    def test_external_link_untouched(self, converter):
+        converter.set_link_map(self.LINK_MAP)
+        html = '<a href="https://example.com/page">x</a>'
+        result = converter.preprocess_html(html, current_path="Readme.md")
+        assert 'href="https://example.com/page"' in result
+
+    def test_no_rewrite_without_link_map(self, converter):
+        html = '<a href="/wiki/spaces/TEAM/pages/67890/Other+Page">x</a>'
+        result = converter.preprocess_html(html, current_path="Readme.md")
+        assert "/wiki/spaces/TEAM/pages/67890" in result
+
+    def test_convert_page_rewrites_via_current_page_id(self, converter):
+        converter.set_link_map({"1": "Readme.md", "67890": "Section/Other Page.md"})
+        page_data = {
+            "body": '<a href="/wiki/spaces/TEAM/pages/67890/Other+Page">Other</a>',
+            "comments": [],
+            "attachments": [],
+        }
+        md = converter.convert_page(page_data, current_page_id="1")
+        assert "Section/Other%20Page.md" in md
+
+
 class TestConvertPage:
     def test_full_page_conversion(self, converter, sample_page_data):
         md = converter.convert_page(sample_page_data)
