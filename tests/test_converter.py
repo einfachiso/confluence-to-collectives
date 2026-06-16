@@ -226,31 +226,24 @@ class TestRewriteInternalLinks:
         "111": "Readme.md",
     }
 
-    def test_link_rewritten_relative_from_root(self, converter):
+    def test_link_to_migrated_page_becomes_placeholder(self, converter):
         converter.set_link_map(self.LINK_MAP)
         html = '<p>See <a href="/wiki/spaces/TEAM/pages/67890/Other+Page">Other Page</a></p>'
         result = converter.preprocess_html(html, current_path="Readme.md")
-        # From root, target Section/Other Page.md -> "Section/Other%20Page.md"
-        assert 'href="Section/Other%20Page.md"' in result
+        assert 'href="cpage:67890"' in result
 
-    def test_link_rewritten_relative_between_subdirs(self, converter):
-        converter.set_link_map(self.LINK_MAP)
-        html = '<a href="/wiki/spaces/TEAM/pages/111/Home">Home</a>'
-        result = converter.preprocess_html(html, current_path="Section/Leaf.md")
-        # From Section/, target Readme.md at root -> "../Readme.md"
-        assert 'href="../Readme.md"' in result
-
-    def test_anchor_preserved(self, converter):
+    def test_anchor_preserved_in_placeholder(self, converter):
         converter.set_link_map(self.LINK_MAP)
         html = '<a href="/wiki/spaces/TEAM/pages/67890/Other+Page#Heading">x</a>'
         result = converter.preprocess_html(html, current_path="Readme.md")
-        assert 'href="Section/Other%20Page.md#Heading"' in result
+        assert 'href="cpage:67890#Heading"' in result
 
     def test_link_to_unmigrated_page_untouched(self, converter):
         converter.set_link_map(self.LINK_MAP)
         html = '<a href="/wiki/spaces/TEAM/pages/99999/Gone">x</a>'
         result = converter.preprocess_html(html, current_path="Readme.md")
         assert "/wiki/spaces/TEAM/pages/99999/Gone" in result
+        assert "cpage:" not in result
 
     def test_external_link_untouched(self, converter):
         converter.set_link_map(self.LINK_MAP)
@@ -262,8 +255,9 @@ class TestRewriteInternalLinks:
         html = '<a href="/wiki/spaces/TEAM/pages/67890/Other+Page">x</a>'
         result = converter.preprocess_html(html, current_path="Readme.md")
         assert "/wiki/spaces/TEAM/pages/67890" in result
+        assert "cpage:" not in result
 
-    def test_convert_page_rewrites_via_current_page_id(self, converter):
+    def test_convert_page_emits_placeholder_via_current_page_id(self, converter):
         converter.set_link_map({"1": "Readme.md", "67890": "Section/Other Page.md"})
         page_data = {
             "body": '<a href="/wiki/spaces/TEAM/pages/67890/Other+Page">Other</a>',
@@ -271,7 +265,33 @@ class TestRewriteInternalLinks:
             "attachments": [],
         }
         md = converter.convert_page(page_data, current_page_id="1")
-        assert "Section/Other%20Page.md" in md
+        assert "cpage:67890" in md
+
+
+class TestResolvePageLinks:
+    def test_route_segments(self):
+        from migrate import page_route_segments
+        assert page_route_segments("Drafts/Proc/CAPA.md") == ["Drafts", "Proc", "CAPA"]
+        assert page_route_segments("Drafts/Proc/Readme.md") == ["Drafts", "Proc"]
+        assert page_route_segments("Readme.md") == []
+
+    def test_build_map_and_resolve(self, tmp_path):
+        from migrate import MigrationState, build_page_link_map, resolve_page_links
+        state = MigrationState(path=tmp_path / ".migration-state.json")
+        state.set_page("67890", {
+            "page_id": "67890", "space_key": "TEAM", "status": "converted",
+            "convert_path": str(Path("convert_data/TEAM/Section/Other Page.md")),
+        })
+        link_map = build_page_link_map(state, "MigratedPages", "My Collective")
+        # Title-path URL under collective + target parent, segments encoded
+        assert link_map["67890"] == \
+            "/apps/collectives/My%20Collective/MigratedPages/Section/Other%20Page"
+
+        md = "see [X](<cpage:67890>) and [Y](<cpage:67890#Heading>) and [Z](<cpage:55>)"
+        out = resolve_page_links(md, link_map)
+        assert "/apps/collectives/My%20Collective/MigratedPages/Section/Other%20Page>" in out
+        assert "Section/Other%20Page#Heading>" in out
+        assert "cpage:55" in out  # unmapped placeholder left as-is
 
 
 class TestConvertPage:

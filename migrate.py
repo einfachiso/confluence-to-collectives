@@ -529,24 +529,22 @@ class Converter:
             macro.replace_with(Comment(f" Unsupported macro: {name} "))
 
     def _rewrite_internal_links(self, soup, current_path):
-        """Rewrite <a> links targeting migrated Confluence pages to relative
-        links between the output Markdown files. Links to pages outside the
-        migrated set (or non-page links) are left untouched."""
-        current_dir = posixpath.dirname(current_path)
+        """Mark <a> links that target a migrated Confluence page with a
+        `cpage:<id>` placeholder. The placeholder is resolved to a real
+        Collectives page URL at upload time (`resolve_page_links`), because the
+        URL depends on the upload target parent and collective name, which the
+        converter does not know. Links to pages outside the migrated set (or
+        non-page links) are left untouched."""
         for a in soup.find_all("a", href=True):
             href = a["href"]
             m = self.PAGE_LINK_RE.search(href)
             if not m:
                 continue
-            target_path = self.page_link_map.get(m.group(1))
-            if not target_path:
+            target_id = m.group(1)
+            if target_id not in self.page_link_map:
                 continue  # target page not part of this migration — leave as-is
-            anchor = ""
-            if "#" in href:
-                anchor = "#" + href.split("#", 1)[1]
-            rel = posixpath.relpath(target_path, current_dir or ".")
-            rel = "/".join(quote(seg) for seg in rel.split("/"))
-            a["href"] = rel + anchor
+            anchor = "#" + href.split("#", 1)[1] if "#" in href else ""
+            a["href"] = f"cpage:{target_id}{anchor}"
 
     # -- conversion -------------------------------------------------------
 
@@ -854,10 +852,11 @@ class NextcloudClient:
         log.warning("Could not get file ID for %s (HTTP %d)", remote_path, resp.status_code)
         return None
 
-    def file_url(self, file_id, remote_dir):
-        """Build a Nextcloud Files app URL for the given file ID."""
-        dir_path = f"/Collectives/{self.collective}/{remote_dir.lstrip('/')}"
-        return f"{self.base_url}/apps/files/files/{file_id}?dir={quote(dir_path)}&openfile=true"
+    def file_url(self, file_id, remote_dir=None):
+        """Nextcloud "open file by id" URL. Resolves regardless of where the file
+        lives — important because collectives live under the hidden .Collectives
+        folder, which a path-based Files URL (dir=...) cannot navigate into."""
+        return f"{self.base_url}/f/{file_id}"
 
     def exists(self, path):
         """Check if a remote path exists via PROPFIND depth 0."""
@@ -878,6 +877,56 @@ def require_env(*keys):
         raise click.ClickException(
             f"Missing required environment variables: {', '.join(missing)}"
         )
+
+
+# Placeholder emitted by the converter for an internal page link; resolved here.
+CPAGE_LINK_RE = re.compile(r"cpage:(\d+)(#[^)>\s]*)?")
+
+
+def page_route_segments(output_rel_path):
+    """Collectives route segments (page titles) for a converted page file path,
+    relative to the space root. A page's title in Collectives is its file/folder
+    name, so the route is the path with the `.md` stripped and the `Readme.md`
+    of a parent page collapsed to its folder.
+
+    e.g. "Drafts/Proc/CAPA.md" -> ["Drafts", "Proc", "CAPA"]
+         "Drafts/Proc/Readme.md" -> ["Drafts", "Proc"]   (parent/folder page)
+         "Readme.md" -> []                                (space homepage)
+    """
+    p = output_rel_path.replace("\\", "/")
+    if p == "Readme.md":
+        return []
+    if p.endswith("/Readme.md"):
+        p = p[: -len("/Readme.md")]
+    elif p.endswith(".md"):
+        p = p[:-3]
+    return [seg for seg in p.split("/") if seg]
+
+
+def build_page_link_map(state, target_parent, collective):
+    """Map Confluence page_id -> absolute Collectives page URL, for resolving
+    `cpage:` placeholders. Collectives resolves internal links by walking the
+    page-title path under the collective, so the URL is
+    /apps/collectives/<collective>/<target_parent>/<title path>.
+    """
+    link_map = {}
+    for pid, rec in state.pages.items():
+        convert_path = rec.get("convert_path")
+        if not convert_path:
+            continue
+        space_key = rec.get("space_key", "default")
+        rel = Path(convert_path).relative_to(Path("convert_data") / space_key).as_posix()
+        segments = [collective, target_parent, *page_route_segments(rel)]
+        link_map[pid] = "/apps/collectives/" + "/".join(quote(s) for s in segments)
+    return link_map
+
+
+def resolve_page_links(content, link_map):
+    """Replace `cpage:<id>` placeholders in Markdown with real Collectives URLs."""
+    def _sub(m):
+        url = link_map.get(m.group(1))
+        return (url + (m.group(2) or "")) if url else m.group(0)
+    return CPAGE_LINK_RE.sub(_sub, content)
 
 
 def determine_exit_code(state):
@@ -1298,7 +1347,8 @@ def upload(target_parent, dry_run, debug, log_file):
         except Exception as e:
             log.error("Failed to upload attachment %s: %s", remote_path, e)
 
-    # Pass 2: Patch markdown with file-ID links, then upload
+    # Pass 2: Patch markdown with file-ID links + internal page links, then upload
+    page_link_map = build_page_link_map(state, target_parent, os.getenv("NEXTCLOUD_COLLECTIVE", ""))
     uploaded_pages = set()
     for local_file in md_files:
         relative = local_file.relative_to(convert_base)
@@ -1308,6 +1358,9 @@ def upload(target_parent, dry_run, debug, log_file):
 
         try:
             content = local_file.read_text(encoding="utf-8")
+
+            # Resolve internal page-link placeholders to Collectives page URLs
+            content = resolve_page_links(content, page_link_map)
 
             # Replace attachment links with absolute Nextcloud file URLs
             dir_urls = attachment_urls.get(full_remote_dir, {})
@@ -1609,6 +1662,7 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
     nc.mkdir_p(target_parent)
 
     converted = state.get_pages_by_status("converted")
+    page_link_map = build_page_link_map(state, target_parent, os.getenv("NEXTCLOUD_COLLECTIVE", ""))
     for pid, page_rec in converted.items():
         sk = page_rec.get("space_key", "default")
         convert_base = Path("convert_data") / sk
@@ -1627,7 +1681,16 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
             nc.mkdir_p(f"{target_parent}/{parent_dirs}")
 
         try:
-            nc.upload_file(str(convert_file), remote_path)
+            # Resolve internal page-link placeholders, then upload patched content
+            content = resolve_page_links(convert_file.read_text(encoding="utf-8"), page_link_map)
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False,
+                                             encoding="utf-8") as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            try:
+                nc.upload_file(tmp_path, remote_path)
+            finally:
+                os.unlink(tmp_path)
 
             # Also upload attachments in the same directory
             output_dir = convert_file.parent
