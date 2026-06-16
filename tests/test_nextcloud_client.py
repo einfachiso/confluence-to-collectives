@@ -122,20 +122,64 @@ class TestDavBasePath:
         assert nc.dav_base == "https://nc.example.com/remote.php/dav/files/alice/.Collectives/Team Notes"
 
     def test_verify_connection_falls_back_to_legacy_folder(self, nc):
-        """If '.Collectives' 404s but 'Collectives' exists, use the legacy name."""
+        """If the OCS API has no match and '.Collectives' 404s, use 'Collectives'."""
         def fake_request(method, url, **kwargs):
             resp = MagicMock()
             resp.status_code = 207 if "/.Collectives/" not in url else 404
             return resp
 
-        with patch.object(nc.session, "request", side_effect=fake_request):
+        no_ocs = MagicMock(status_code=404)  # API unavailable -> probe folders
+        with patch.object(nc.session, "get", return_value=no_ocs), \
+                patch.object(nc.session, "request", side_effect=fake_request):
             nc.verify_connection()
         assert nc.collectives_dir == "Collectives"
         assert nc.dav_base.endswith("/Collectives/MyCollective")
 
     def test_verify_connection_prefers_hidden_folder(self, nc):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 207
-        with patch.object(nc.session, "request", return_value=mock_resp):
+        no_ocs = MagicMock(status_code=404)
+        ok = MagicMock(status_code=207)
+        with patch.object(nc.session, "get", return_value=no_ocs), \
+                patch.object(nc.session, "request", return_value=ok):
             nc.verify_connection()
         assert nc.collectives_dir == ".Collectives"
+
+
+class TestResolveCollective:
+    def _client(self, configured):
+        return NextcloudClient("https://nc.example.com", "user", "pw", configured)
+
+    def _ocs(self, collectives, pages):
+        lst = MagicMock(status_code=200)
+        lst.json.return_value = {"ocs": {"data": {"collectives": collectives}}}
+        pg = MagicMock(status_code=200)
+        pg.json.return_value = {"ocs": {"data": {"pages": pages}}}
+        return lambda url, **kw: pg if "/pages" in url else lst
+
+    def test_resolves_localised_folder_name_and_segment(self):
+        nc = self._client("MyTeam-7")  # configured as <slug>-<id>
+        get = self._ocs(
+            [{"id": 7, "name": "My Team", "slug": "MyTeam"}],
+            [{"collectivePath": ".Kollektive/My Team"}],
+        )
+        with patch.object(nc.session, "get", side_effect=get):
+            assert nc.resolve_collective() is True
+        assert nc.collective == "My Team"           # WebDAV folder = display name
+        assert nc.collective_segment == "MyTeam-7"   # link URL segment
+        assert nc.collectives_dir == ".Kollektive"   # localised storage folder
+        assert nc.dav_base.endswith("/.Kollektive/My Team")
+
+    def test_matches_by_display_name(self):
+        nc = self._client("My Team")
+        get = self._ocs([{"id": 7, "name": "My Team", "slug": "MyTeam"}],
+                        [{"collectivePath": ".Collectives/My Team"}])
+        with patch.object(nc.session, "get", side_effect=get):
+            assert nc.resolve_collective() is True
+        assert nc.collective_segment == "MyTeam-7"
+
+    def test_no_match_returns_false(self):
+        nc = self._client("Nope")
+        lst = MagicMock(status_code=200)
+        lst.json.return_value = {"ocs": {"data": {"collectives": [
+            {"id": 1, "name": "Other", "slug": "Other"}]}}}
+        with patch.object(nc.session, "get", return_value=lst):
+            assert nc.resolve_collective() is False

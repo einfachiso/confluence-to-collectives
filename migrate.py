@@ -745,9 +745,11 @@ class NextcloudClient:
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.collective = collective
+        # URL segment for internal page links; slug-id form after resolution.
+        self.collective_segment = collective
         self.files_base = f"{self.base_url}/remote.php/dav/files/{username}"
-        # Default to the modern hidden folder; verify_connection() may switch to
-        # the legacy name if that is what the server actually exposes.
+        # Default to the modern hidden folder; resolution may switch it (incl.
+        # localised names like '.Kollektive').
         self.collectives_dir = self.COLLECTIVES_DIRS[0]
         self.session = requests.Session()
         self.session.auth = (username, password)
@@ -756,12 +758,73 @@ class NextcloudClient:
     def dav_base(self):
         return f"{self.files_base}/{self.collectives_dir}/{self.collective}"
 
-    def verify_connection(self):
-        """Verify we can reach the collective, auto-detecting the storage folder.
+    def _ocs_get(self, path):
+        return self.session.get(
+            f"{self.base_url}{path}",
+            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+        )
 
-        Tries ".Collectives/<name>" then "Collectives/<name>" so the tool works
-        against both modern and legacy Collectives without configuration.
+    def resolve_collective(self):
+        """Resolve the configured collective via the Collectives OCS API.
+
+        Matches the configured NEXTCLOUD_COLLECTIVE against each collective's
+        name, slug, or '<slug>-<id>'. On a match, sets the WebDAV folder name
+        (the display name), the storage folder read from a page's
+        `collectivePath` (so localised folders like '.Kollektive' work without
+        guessing), and the '<slug>-<id>' URL segment used for internal links.
+        Returns True on success, False if the API/match is unavailable.
         """
+        try:
+            resp = self._ocs_get("/ocs/v2.php/apps/collectives/api/v1.0/collectives")
+            if resp.status_code != 200:
+                return False
+            collectives = resp.json().get("ocs", {}).get("data", {}).get("collectives", [])
+        except Exception:
+            return False
+
+        match = next(
+            (c for c in collectives
+             if self.collective in (c.get("name"), c.get("slug"), f"{c.get('slug')}-{c.get('id')}")),
+            None,
+        )
+        if not match:
+            return False
+
+        cid = match["id"]
+        self.collective = match.get("name")               # WebDAV folder = display name
+        self.collective_segment = f"{match.get('slug')}-{cid}"
+        try:  # localised storage folder, read rather than guessed
+            pages = (self._ocs_get(
+                f"/ocs/v2.php/apps/collectives/api/v1.0/collectives/{cid}/pages")
+                .json().get("ocs", {}).get("data", {}).get("pages", []))
+            for p in pages:
+                cp = p.get("collectivePath")
+                if cp and "/" in cp:
+                    self.collectives_dir = cp.split("/", 1)[0]
+                    break
+        except Exception:
+            pass
+        return True
+
+    def verify_connection(self):
+        """Verify we can reach the collective.
+
+        Prefers the Collectives OCS API (handles localised storage folders and
+        display-name vs slug). Falls back to probing '.Collectives'/'Collectives'
+        for older servers without the API.
+        """
+        if self.resolve_collective():
+            resp = self.session.request("PROPFIND", self.dav_base, headers={"Depth": "0"})
+            if resp.status_code == 401:
+                raise click.ClickException("Nextcloud authentication failed — check credentials.")
+            if resp.status_code in (200, 207):
+                log.info("Connected to Nextcloud collective: %s (under %s)",
+                         self.collective, self.collectives_dir)
+                return
+            raise click.ClickException(
+                f"Collective '{self.collective}' resolved but {self.dav_base} "
+                f"returned HTTP {resp.status_code}")
+
         last_status = None
         for candidate in self.COLLECTIVES_DIRS:
             self.collectives_dir = candidate
@@ -769,21 +832,16 @@ class NextcloudClient:
             if resp.status_code == 401:
                 raise click.ClickException("Nextcloud authentication failed — check credentials.")
             if resp.status_code in (200, 207):
-                log.info(
-                    "Connected to Nextcloud collective: %s (under %s)",
-                    self.collective, candidate,
-                )
+                log.info("Connected to Nextcloud collective: %s (under %s)",
+                         self.collective, candidate)
                 return
             last_status = resp.status_code
 
         if last_status == 404:
             raise click.ClickException(
-                f"Collective '{self.collective}' not found under "
-                f"{'/'.join(self.COLLECTIVES_DIRS)} for user {self.username}."
-            )
-        raise click.ClickException(
-            f"Nextcloud PROPFIND failed with status {last_status}"
-        )
+                f"Collective '{self.collective}' not found (no OCS match; probed "
+                f"{'/'.join(self.COLLECTIVES_DIRS)}) for user {self.username}.")
+        raise click.ClickException(f"Nextcloud PROPFIND failed with status {last_status}")
 
     @staticmethod
     def _remote(path):
@@ -1337,7 +1395,7 @@ def upload(target_parent, dry_run, debug, log_file):
             log.error("Failed to upload attachment %s: %s", remote_path, e)
 
     # Pass 2: Patch markdown with file-ID links + internal page links, then upload
-    page_link_map = build_page_link_map(state, target_parent, os.getenv("NEXTCLOUD_COLLECTIVE", ""))
+    page_link_map = build_page_link_map(state, target_parent, nc.collective_segment)
     uploaded_pages = set()
     for local_file in md_files:
         relative = local_file.relative_to(convert_base)
@@ -1651,7 +1709,7 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
     nc.mkdir_p(target_parent)
 
     converted = state.get_pages_by_status("converted")
-    page_link_map = build_page_link_map(state, target_parent, os.getenv("NEXTCLOUD_COLLECTIVE", ""))
+    page_link_map = build_page_link_map(state, target_parent, nc.collective_segment)
     for pid, page_rec in converted.items():
         sk = page_rec.get("space_key", "default")
         convert_base = Path("convert_data") / sk
