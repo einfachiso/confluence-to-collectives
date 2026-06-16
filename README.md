@@ -218,6 +218,11 @@ These are development tools only — `migrate.py` has zero MCP dependency and us
 
 ## Changelog
 
+### Unreleased
+
+- Fix: Attachment downloads now use the REST `content/child/attachment/{id}/download` route, which works with API tokens — the legacy `downloadLink` servlet rejected API-token auth on Cloud (HTTP 401), so attachments silently went missing (kept as fallback)
+- Fix: Remote WebDAV paths are normalised to `/` so migrations run on Windows — backslashes from `pathlib` were leaking into WebDAV URLs and failing nested-page uploads (HTTP 400)
+
 ### 0.6.0
 
 - Fix: SVG files are no longer embedded inline via `![](file.svg)` — Nextcloud Collectives blocks SVG rendering for security. SVGs now appear in the `## Attachments` section as clickable links instead (fixes #3)

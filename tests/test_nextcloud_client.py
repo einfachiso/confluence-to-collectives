@@ -54,6 +54,17 @@ class TestMkdirP:
             assert urls[1].endswith("/a/b")
             assert urls[2].endswith("/a/b/c")
 
+    def test_backslash_path_normalised(self, nc):
+        """Windows path separators must become '/' in WebDAV URLs (HTTP 400 bug)."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 201
+        with patch.object(nc.session, "request", return_value=mock_resp) as mock_req:
+            nc.mkdir_p("a\\b\\c")
+            urls = [c[0][1] for c in mock_req.call_args_list]
+            assert mock_req.call_count == 3
+            assert "\\" not in urls[-1]
+            assert urls[-1].endswith("/a/b/c")
+
     def test_ignores_405_already_exists(self, nc):
         mock_resp = MagicMock()
         mock_resp.status_code = 405  # Already exists

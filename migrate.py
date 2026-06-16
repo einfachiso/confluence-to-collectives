@@ -294,12 +294,27 @@ class ConfluenceClient:
     def get_page_attachments(self, page_id):
         return list(self._paginate(f"/wiki/api/v2/pages/{page_id}/attachments"))
 
-    def download_attachment(self, download_url):
-        """Download attachment binary. Prepends /wiki to relative URLs."""
-        if download_url.startswith("/download/") or download_url.startswith("/rest/"):
-            download_url = f"/wiki{download_url}"
-        resp = self._request("GET", download_url)
-        return resp.content
+    def download_attachment(self, content_id, attachment_id, fallback_url=None):
+        """Download an attachment binary.
+
+        Uses the REST route /wiki/rest/api/content/{id}/child/attachment/{attId}/download,
+        which honours API-token Basic auth and 302-redirects to the media binary.
+        The attachment's own `downloadLink` instead points at the legacy
+        /wiki/download servlet, which rejects API tokens (HTTP 401 + "OAuth"
+        challenge) on Cloud sites — so it is only used as a last-resort fallback.
+        """
+        try:
+            url = (
+                f"/wiki/rest/api/content/{content_id}"
+                f"/child/attachment/{attachment_id}/download"
+            )
+            return self._request("GET", url).content
+        except requests.HTTPError:
+            if fallback_url:
+                if fallback_url.startswith("/download/") or fallback_url.startswith("/rest/"):
+                    fallback_url = f"/wiki{fallback_url}"
+                return self._request("GET", fallback_url).content
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -689,9 +704,14 @@ class NextcloudClient:
             )
         log.info("Connected to Nextcloud collective: %s", self.collective)
 
+    @staticmethod
+    def _remote(path):
+        """Normalise a remote path for WebDAV URLs (Windows backslashes → '/')."""
+        return path.replace("\\", "/")
+
     def mkdir_p(self, path):
         """Recursively create directories via MKCOL."""
-        parts = path.strip("/").split("/")
+        parts = self._remote(path).strip("/").split("/")
         current = self.dav_base
         for part in parts:
             if not part:
@@ -704,6 +724,7 @@ class NextcloudClient:
     def upload_file(self, local_path, remote_path):
         """Upload a file via PUT."""
         import mimetypes
+        remote_path = self._remote(remote_path)
         url = f"{self.dav_base}/{remote_path.lstrip('/')}"
         content_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
         with open(local_path, "rb") as f:
@@ -718,6 +739,7 @@ class NextcloudClient:
         """Get Nextcloud file ID via PROPFIND."""
         import xml.etree.ElementTree as ET
 
+        remote_path = self._remote(remote_path)
         url = f"{self.dav_base}/{remote_path.lstrip('/')}"
         body = (
             '<?xml version="1.0"?>'
@@ -745,7 +767,7 @@ class NextcloudClient:
 
     def exists(self, path):
         """Check if a remote path exists via PROPFIND depth 0."""
-        url = f"{self.dav_base}/{path.lstrip('/')}"
+        url = f"{self.dav_base}/{self._remote(path).lstrip('/')}"
         resp = self.session.request("PROPFIND", url, headers={"Depth": "0"})
         return resp.status_code in (200, 207)
 
@@ -940,14 +962,12 @@ def export(space_key, pages, all_spaces, exclude_images, exclude_attachments, dr
                             if exclude_images and ext in image_exts:
                                 continue
 
-                            download_url = att.get("downloadLink", "")
-                            if not download_url:
-                                # Fallback: try _links.download
-                                download_url = att.get("_links", {}).get("download", "")
+                            att_id = att.get("id")
+                            fallback = att.get("downloadLink") or att.get("_links", {}).get("download")
 
-                            if download_url:
+                            if att_id or fallback:
                                 try:
-                                    data = client.download_attachment(download_url)
+                                    data = client.download_attachment(page_id, att_id, fallback_url=fallback)
                                     att_dir.mkdir(parents=True, exist_ok=True)
                                     (att_dir / att_title).write_bytes(data)
                                     attachments.append({
@@ -1158,7 +1178,7 @@ def upload(target_parent, dry_run, debug, log_file):
     # Ensure all parent directories are created
     created_dirs = set()
     for local_file in all_files:
-        parent_dirs = str(local_file.relative_to(convert_base).parent)
+        parent_dirs = local_file.relative_to(convert_base).parent.as_posix()
         if parent_dirs and parent_dirs != "." and parent_dirs not in created_dirs:
             nc.mkdir_p(f"{target_parent}/{parent_dirs}")
             created_dirs.add(parent_dirs)
@@ -1168,13 +1188,13 @@ def upload(target_parent, dry_run, debug, log_file):
     attachment_urls = {}
     for local_file in attachment_files:
         relative = local_file.relative_to(convert_base)
-        remote_path = f"{target_parent}/{relative}"
+        remote_path = f"{target_parent}/{relative.as_posix()}"
         try:
             nc.upload_file(str(local_file), remote_path)
             log.info("Uploaded attachment: %s", remote_path)
             file_id = nc.get_file_id(remote_path)
             if file_id:
-                remote_dir = str(relative.parent) if str(relative.parent) != "." else ""
+                remote_dir = relative.parent.as_posix() if str(relative.parent) != "." else ""
                 full_remote_dir = f"{target_parent}/{remote_dir}".rstrip("/")
                 encoded_name = quote(local_file.name)
                 attachment_urls.setdefault(full_remote_dir, {})[encoded_name] = \
@@ -1187,8 +1207,8 @@ def upload(target_parent, dry_run, debug, log_file):
     uploaded_pages = set()
     for local_file in md_files:
         relative = local_file.relative_to(convert_base)
-        remote_path = f"{target_parent}/{relative}"
-        remote_dir = str(relative.parent) if str(relative.parent) != "." else ""
+        remote_path = f"{target_parent}/{relative.as_posix()}"
+        remote_dir = relative.parent.as_posix() if str(relative.parent) != "." else ""
         full_remote_dir = f"{target_parent}/{remote_dir}".rstrip("/")
 
         try:
@@ -1365,12 +1385,11 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
                             ext = Path(att_title).suffix.lower()
                             if exclude_images and ext in image_exts:
                                 continue
-                            download_url = att.get("downloadLink", "")
-                            if not download_url:
-                                download_url = att.get("_links", {}).get("download", "")
-                            if download_url:
+                            att_id = att.get("id")
+                            fallback = att.get("downloadLink") or att.get("_links", {}).get("download")
+                            if att_id or fallback:
                                 try:
-                                    data = conf_client.download_attachment(download_url)
+                                    data = conf_client.download_attachment(page_id, att_id, fallback_url=fallback)
                                     att_dir.mkdir(parents=True, exist_ok=True)
                                     (att_dir / att_title).write_bytes(data)
                                     attachments.append({"title": att_title, "size": len(data), "mediaType": att.get("mediaType", "")})
@@ -1505,9 +1524,9 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
 
         convert_file = Path(convert_path)
         relative = convert_file.relative_to(convert_base)
-        remote_path = f"{target_parent}/{relative}"
+        remote_path = f"{target_parent}/{relative.as_posix()}"
 
-        parent_dirs = str(relative.parent)
+        parent_dirs = relative.parent.as_posix()
         if parent_dirs and parent_dirs != ".":
             nc.mkdir_p(f"{target_parent}/{parent_dirs}")
 
@@ -1519,7 +1538,7 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
             for f in output_dir.iterdir():
                 if f.is_file() and f != convert_file and f.suffix != ".md":
                     f_relative = f.relative_to(convert_base)
-                    f_remote = f"{target_parent}/{f_relative}"
+                    f_remote = f"{target_parent}/{f_relative.as_posix()}"
                     nc.upload_file(str(f), f_remote)
                     log.debug("Uploaded attachment: %s", f_remote)
 

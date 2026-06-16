@@ -108,28 +108,36 @@ class TestRateLimiting:
 
 
 class TestDownloadURL:
-    def test_prepend_wiki_to_relative_download(self, client):
+    def test_uses_rest_child_attachment_route(self, client):
+        """Primary download must use the REST content/child/attachment route,
+        which honours API-token Basic auth (the legacy /wiki/download servlet
+        rejects API tokens with HTTP 401)."""
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.content = b"file-data"
         mock_resp.raise_for_status = MagicMock()
 
         with patch.object(client.session, "request", return_value=mock_resp) as mock_req:
-            client.download_attachment("/download/attachments/123/file.png")
-            # Should have prepended /wiki
+            data = client.download_attachment("123", "att999", fallback_url="/download/attachments/123/file.png")
+            assert data == b"file-data"
             call_url = mock_req.call_args[0][1]
-            assert call_url.startswith("https://test.atlassian.net/wiki/download/")
+            assert call_url.endswith("/wiki/rest/api/content/123/child/attachment/att999/download")
 
-    def test_absolute_url_unchanged(self, client):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.content = b"file-data"
-        mock_resp.raise_for_status = MagicMock()
+    def test_falls_back_to_download_link_on_error(self, client):
+        import requests
 
-        with patch.object(client.session, "request", return_value=mock_resp) as mock_req:
-            client.download_attachment("https://cdn.example.com/file.png")
-            call_url = mock_req.call_args[0][1]
-            assert call_url == "https://cdn.example.com/file.png"
+        ok = MagicMock(status_code=200, content=b"img", raise_for_status=MagicMock())
+
+        def side_effect(method, url, **kwargs):
+            if "/child/attachment/" in url:
+                raise requests.HTTPError("404")
+            return ok
+
+        with patch.object(client.session, "request", side_effect=side_effect) as mock_req:
+            data = client.download_attachment("123", "att999", fallback_url="/download/attachments/123/file.png")
+            assert data == b"img"
+            # fallback prepends /wiki to the servlet link
+            assert mock_req.call_args[0][1].startswith("https://test.atlassian.net/wiki/download/")
 
 
 class TestSpaceResolution:
