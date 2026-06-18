@@ -13,6 +13,7 @@ export_data/
 convert_data/
 .migration-state.json
 data/
+mermaid-map.json
 
 # MCP (development only, contains credentials)
 *.mcp.json

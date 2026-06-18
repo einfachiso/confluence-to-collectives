@@ -333,13 +333,43 @@ class Converter:
     #   https://x.atlassian.net/wiki/spaces/TEAM/pages/67890
     PAGE_LINK_RE = re.compile(r"/pages/(\d+)")
 
-    def __init__(self, exclude_images=False, exclude_attachments=False, strip_patterns=None):
+    # Confluence information-macro suffix -> Nextcloud Text callout type.
+    PANEL_CALLOUT_TYPES = {
+        "information": "info",
+        "tip": "success",
+        "note": "warn",
+        "warning": "error",
+    }
+
+    def __init__(self, exclude_images=False, exclude_attachments=False, strip_patterns=None,
+                 mermaid_map=None, toc_url=None, dokinfo_url=None, dokinfo_patterns=None):
         self.exclude_images = exclude_images
         self.exclude_attachments = exclude_attachments
         # Text substrings; any block (table/div/etc.) whose text contains one is
         # removed during preprocessing. Used to drop boilerplate such as a
         # per-page copyright box. Configured via STRIP_CONTENT_PATTERNS.
         self.strip_patterns = [p for p in (strip_patterns or []) if p]
+        # Weber-specific (config-driven; absent values disable the transform):
+        #   mermaid_map     {image_filename: mermaid_text} — draw.io <img> → ```mermaid block
+        #   toc_url         wcextend smartpicker URL — replaces a static TOC macro
+        #   dokinfo_url     wcextend smartpicker URL — replaces the document-header table
+        #   dokinfo_patterns text substrings identifying that header table
+        self.mermaid_map = mermaid_map or {}
+        self.toc_url = toc_url
+        self.dokinfo_url = dokinfo_url
+        self.dokinfo_patterns = [p for p in (dokinfo_patterns or []) if p]
+        # Block-level literal markdown can't survive the BeautifulSoup→html2text
+        # pass, so weber transforms emit an alphanumeric sentinel token in a <p>
+        # during preprocessing and swap it for the real markdown after conversion.
+        # Reset per page (in preprocess_html) since the Converter is reused.
+        self._md_tokens = {}
+        self._tok_counter = 0
+        # Per-page draw.io preview bookkeeping (filenames of the `.drawio.png`):
+        #   _drawio_replaced  previews swapped for a mermaid block → omit from upload
+        #   _drawio_fallback  previews kept inline because no mermaid mapping exists
+        #                     → must NOT be omitted (else the page loses its diagram)
+        self._drawio_replaced = set()
+        self._drawio_fallback = set()
         # page_id -> output path relative to the space root (e.g. "Section/Leaf.md").
         # Populated via set_link_map() so internal page links can be rewritten to
         # relative links between the migrated Markdown files.
@@ -362,8 +392,19 @@ class Converter:
         """
         soup = BeautifulSoup(html, "html.parser")
 
+        # Reset per-page sentinel-token state (the Converter is reused across pages)
+        self._md_tokens = {}
+        self._tok_counter = 0
+        self._drawio_replaced = set()
+        self._drawio_fallback = set()
+
         # Drop configured boilerplate blocks (e.g. a per-page copyright box)
         self._strip_configured_content(soup)
+
+        # Replace the document-header (dokinfo) table with a wcextend link preview.
+        # Runs before the table-cell flatten step below so the header cells aren't
+        # mangled first. No-op unless dokinfo_url + dokinfo_patterns are configured.
+        self._replace_dokinfo(soup)
 
         # Remove leading <hr> tags — html2text converts them to "---" which
         # Nextcloud Collectives misinterprets as YAML front matter
@@ -433,17 +474,21 @@ class Converter:
                     if parts:
                         cell.insert(0, " — ".join(parts))
 
-        # Info / warning / note panels → blockquotes. No "Info:"/"Note:" label is
-        # prepended: Collectives renders the blockquote distinctly, and Confluence
-        # panel bodies frequently already start with their own label, so a prefix
-        # just duplicates it.
+        # Info / warning / note / tip panels → Nextcloud Text callout blocks
+        # (`::: <type> … :::`). The body is converted to markdown and wrapped in a
+        # sentinel token; the panel-type class maps to the callout vocabulary.
         for panel in soup.find_all("div", class_=re.compile(r"(confluence-information-macro)")):
             body = panel.find("div", class_="confluence-information-macro-body")
-            if body:
-                bq = soup.new_tag("blockquote")
-                for child in list(body.children):
-                    bq.append(child.extract() if isinstance(child, Tag) else child)
-                panel.replace_with(bq)
+            if not body:
+                continue
+            ctype = "info"
+            for c in panel.get("class", []):
+                if c.startswith("confluence-information-macro-"):
+                    suffix = c.rsplit("-", 1)[-1]
+                    if suffix in self.PANEL_CALLOUT_TYPES:
+                        ctype = self.PANEL_CALLOUT_TYPES[suffix]
+            body_md = self.html_to_markdown(str(body))
+            self._tokenize(soup, panel, f"::: {ctype}\n\n{body_md}\n\n:::")
 
         # Code blocks — preserve language hints
         for code_macro in soup.find_all("div", class_="code-block"):
@@ -478,6 +523,16 @@ class Converter:
             display = mention.get_text(strip=True)
             if display:
                 mention.replace_with(f"@{display}")
+
+        # Static table-of-contents macro → wcextend link preview (no-op unless
+        # toc_url is configured). Runs before the image rewrite so any diagram
+        # inside is irrelevant.
+        self._replace_toc(soup)
+
+        # draw.io diagram <img> → ```mermaid block when a mapping exists (no-op
+        # unless mermaid_map is configured). Must run before the generic image
+        # rewrite so the diagram image is consumed first.
+        self._replace_drawio_images(soup)
 
         # Rewrite image src to local filenames; remove non-image files (e.g. .mp4)
         image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
@@ -565,6 +620,116 @@ class Converter:
             anchor = "#" + href.split("#", 1)[1] if "#" in href else ""
             a["href"] = f"cpage:{target_id}{anchor}"
 
+    # -- weber sentinel tokens + transforms -------------------------------
+
+    def _new_token(self):
+        """A markdown-safe, alphanumeric-only sentinel that survives html2text."""
+        self._tok_counter += 1
+        return f"WCEXTEND{self._tok_counter:04d}"
+
+    def _tokenize(self, soup, element, markdown):
+        """Replace `element` with a <p> carrying a sentinel token; stash the
+        literal markdown to be restored after html2text conversion."""
+        token = self._new_token()
+        self._md_tokens[token] = markdown
+        p = soup.new_tag("p")
+        p.string = token
+        element.replace_with(p)
+
+    def _restore_md_tokens(self, md):
+        """Swap sentinel tokens back for their literal markdown blocks."""
+        for token, value in self._md_tokens.items():
+            md = md.replace(token, value)
+        if "WCEXTEND" in md:
+            log.warning("Unresolved WCEXTEND sentinel token after conversion")
+        return md
+
+    @staticmethod
+    def _link_preview_md(url):
+        """wcextend link-preview line, e.g. `[<url>](<url> (preview))`."""
+        return f"[{url}]({url} (preview))"
+
+    def _replace_dokinfo(self, soup):
+        """Replace the document-header (dokinfo) table with a wcextend link
+        preview. Targets the table (incl. its `table-wrap` div) enclosing the
+        first configured pattern; one per page. No-op unless configured."""
+        if not (self.dokinfo_url and self.dokinfo_patterns):
+            return
+        for pattern in self.dokinfo_patterns:
+            node = soup.find(string=lambda s, p=pattern: s and p in s)
+            if node is None:
+                continue
+            block = node.find_parent("table") or node.find_parent(["div", "p", "li"])
+            if block is None:
+                continue
+            target = block.find_parent("div", class_="table-wrap") or block
+            self._tokenize(soup, target, self._link_preview_md(self.dokinfo_url))
+            return
+
+    def _replace_toc(self, soup):
+        """Replace each static TOC macro (`div.toc-macro`) with a wcextend link
+        preview, dropping its associated `<style>` block. No-op unless
+        toc_url is configured (so pages without a TOC are untouched)."""
+        if not self.toc_url:
+            return
+        for toc in soup.find_all("div", class_="toc-macro"):
+            rbtoc = next((c for c in toc.get("class", []) if c.startswith("rbtoc")), None)
+            if rbtoc:
+                for style in soup.find_all("style"):
+                    if rbtoc in (style.string or ""):
+                        style.decompose()
+            self._tokenize(soup, toc, self._link_preview_md(self.toc_url))
+
+    # Page id inside an attachment URL, e.g. /wiki/download/attachments/12345/x.png
+    ATTACHMENT_PAGE_RE = re.compile(r"/attachments?/(\d+)/")
+
+    def _replace_drawio_images(self, soup):
+        """Replace a draw.io diagram <img> with a ```mermaid block when the
+        mermaid map has a matching entry. The map is keyed by `<page-id>/<file>`
+        (the same diagram filename recurs across pages with different content, so
+        the page id disambiguates); a bare filename key is accepted as a fallback.
+        Diagrams without a mapping are left as their PNG image (logged)."""
+        if not self.mermaid_map:
+            return
+        for img in soup.find_all("img"):
+            src = img.get("src", "")
+            if not src or src.startswith("data:"):
+                continue
+            filename = unquote(src.split("/")[-1].split("?")[0])
+            m = self.ATTACHMENT_PAGE_RE.search(src)
+            keys = ([f"{m.group(1)}/{filename}"] if m else []) + [filename]
+            mermaid = next((self.mermaid_map[k] for k in keys if k in self.mermaid_map), None)
+            if mermaid is None:
+                if filename.endswith(".drawio.png"):
+                    # Embedded draw.io preview with no mapping — keep it inline as a
+                    # fallback (and protect its attachment from being omitted).
+                    log.warning("No mermaid mapping for draw.io diagram: %s", filename)
+                    self._drawio_fallback.add(filename)
+                continue
+            block = "```mermaid\n" + mermaid.strip("\n") + "\n```"
+            self._tokenize(soup, img, block)
+            self._drawio_replaced.add(filename)
+
+    def _drawio_omit_names(self, attachments):
+        """Attachment titles to omit from upload/listing. draw.io clutters a page
+        with several artefacts; all are dropped EXCEPT a preview kept inline as a
+        fallback (an embedded diagram with no mermaid mapping):
+
+          * sources / autosave — mediaType application/vnd.jgraph.mxfile (covers
+            `<name>.drawio`, extension-less sources, and `~…tmp`)
+          * rendered previews — `<name>.drawio.png`, plus the `<name>.png` twin of
+            an extension-less mxfile source on the same page
+        """
+        mxfile = {a.get("title", "") for a in attachments
+                  if a.get("mediaType") == "application/vnd.jgraph.mxfile"}
+        omit = set(mxfile)
+        for a in attachments:
+            t = a.get("title", "")
+            is_preview = t.endswith(".drawio.png") or (t.endswith(".png") and t[:-4] in mxfile)
+            if is_preview and t not in self._drawio_fallback:
+                omit.add(t)
+        return omit
+
     # -- conversion -------------------------------------------------------
 
     def set_link_map(self, page_link_map):
@@ -586,16 +751,21 @@ class Converter:
         current_path = self.page_link_map.get(str(current_page_id)) if current_page_id else None
         processed = self.preprocess_html(html, attachment_names, current_path=current_path)
         md = self.html_to_markdown(processed)
+        # Swap weber sentinel tokens for their literal markdown blocks. Done here
+        # (not on the freshly generated comment/attachment sections below, which
+        # never contain tokens) right after conversion.
+        md = self._restore_md_tokens(md)
 
         # Append comments
         comments = page_data.get("comments", [])
         if comments:
             md += "\n\n" + self.format_comments(comments)
 
-        # Append attachment links (non-image only)
+        # Append attachment links (non-image only; draw.io artefacts omitted)
         attachments = page_data.get("attachments", [])
         if attachments and not self.exclude_attachments:
-            section = self.generate_attachment_section(attachments)
+            section = self.generate_attachment_section(
+                attachments, omit=self._drawio_omit_names(attachments))
             if section:
                 md += "\n\n" + section
 
@@ -631,12 +801,15 @@ class Converter:
             parts.append("")
         return "\n".join(parts)
 
-    def generate_attachment_section(self, attachments):
+    def generate_attachment_section(self, attachments, omit=None):
         """Generate ## Attachments section for non-image files."""
+        omit = omit or set()
         image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
         non_image = []
         for a in attachments:
             title = a.get("title", "")
+            if title in omit:
+                continue
             ext = Path(title).suffix.lower()
             if ext not in image_exts:
                 non_image.append(title)
@@ -738,11 +911,16 @@ class Converter:
 
         image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
         attachments = page_data.get("attachments", [])
+        # Skip draw.io artefacts (sources + previews replaced by mermaid). Relies
+        # on self._drawio_replaced from this page's preceding convert_page call.
+        omit = self._drawio_omit_names(attachments)
 
         for a in attachments:
             title = a.get("title", "")
             ext = Path(title).suffix.lower()
 
+            if title in omit:
+                continue
             if self.exclude_images and ext in image_exts:
                 continue
 
@@ -951,6 +1129,42 @@ def strip_patterns_from_env():
     """Content-strip patterns from STRIP_CONTENT_PATTERNS (||| separated)."""
     raw = os.getenv("STRIP_CONTENT_PATTERNS", "")
     return [p.strip() for p in raw.split("|||") if p.strip()]
+
+
+def _load_mermaid_map(path):
+    """Load {image_filename: mermaid_text} from a JSON file; tolerate
+    missing/malformed files (→ empty map + warning)."""
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("Could not read mermaid map %s: %s", path, e)
+        return {}
+    if isinstance(data, dict):
+        return data
+    log.warning("Mermaid map %s is not a JSON object; ignoring", path)
+    return {}
+
+
+def weber_config_from_env():
+    """Weber-specific Converter kwargs from env. Every value is optional; absent
+    values disable the corresponding transform, so non-weber runs are unaffected.
+      WCEXTEND_TOC_URL          static TOC macro → link preview
+      WCEXTEND_DOKINFO_URL      document-header table → link preview
+      WCEXTEND_DOKINFO_PATTERNS ||| separated text substrings identifying it
+      WCEXTEND_MERMAID_MAP      path to the draw.io→mermaid JSON (default mermaid-map.json)
+    """
+    raw_patterns = os.getenv("WCEXTEND_DOKINFO_PATTERNS", "")
+    return {
+        "toc_url": os.getenv("WCEXTEND_TOC_URL") or None,
+        "dokinfo_url": os.getenv("WCEXTEND_DOKINFO_URL") or None,
+        "dokinfo_patterns": [p.strip() for p in raw_patterns.split("|||") if p.strip()],
+        "mermaid_map": _load_mermaid_map(os.getenv("WCEXTEND_MERMAID_MAP", "mermaid-map.json")),
+    }
 
 
 def require_env(*keys):
@@ -1306,7 +1520,7 @@ def convert(exclude_images, exclude_attachments, dry_run, debug, log_file):
         sys.exit(EXIT_SUCCESS)
 
     converter = Converter(exclude_images=exclude_images, exclude_attachments=exclude_attachments,
-                          strip_patterns=strip_patterns_from_env())
+                          strip_patterns=strip_patterns_from_env(), **weber_config_from_env())
     tree = converter.build_output_tree(state)
     converter.set_link_map({pid: info["path"] for pid, info in tree.items()})
 
@@ -1714,7 +1928,7 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
     click.echo("=" * 60)
 
     converter = Converter(exclude_images=exclude_images, exclude_attachments=exclude_attachments,
-                          strip_patterns=strip_patterns_from_env())
+                          strip_patterns=strip_patterns_from_env(), **weber_config_from_env())
     exported = state.get_pages_by_status("exported")
     tree = converter.build_output_tree(state)
     converter.set_link_map({pid: info["path"] for pid, info in tree.items()})

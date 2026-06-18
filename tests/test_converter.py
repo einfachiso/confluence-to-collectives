@@ -4,12 +4,26 @@ import json
 from pathlib import Path
 
 import pytest
-from migrate import Converter, resolve_page_links
+from migrate import Converter, resolve_page_links, weber_config_from_env
 
 
 @pytest.fixture
 def converter():
     return Converter()
+
+
+TOC_URL = "https://nc.example/index.php/apps/wcextend/smartpicker/wcextend-toc"
+DOKINFO_URL = "https://nc.example/index.php/apps/wcextend/smartpicker/wcextend-isms-dokinfo-prozess"
+
+
+@pytest.fixture
+def converter_weber():
+    return Converter(
+        mermaid_map={"CAPA.drawio.png": "flowchart TD\n  A-->B"},
+        toc_url=TOC_URL,
+        dokinfo_url=DOKINFO_URL,
+        dokinfo_patterns=["Dokumentenlenkung-Header"],
+    )
 
 
 @pytest.fixture
@@ -120,42 +134,55 @@ class TestPreprocessImageUrls:
         assert "data:image/png;base64" in result
 
 
+def _md(converter, html):
+    """Convert a body of HTML to final markdown (preprocess → html2text →
+    sentinel-token restore) the way convert_page does."""
+    return converter.convert_page({"body": html, "attachments": [], "comments": []})
+
+
 class TestPreprocessPanels:
+    """Confluence info panels → Nextcloud Text callout blocks (`::: <type> … :::`)."""
+
     def test_info_panel(self, converter):
         html = '''<div class="confluence-information-macro confluence-information-macro-information">
             <span class="aui-icon confluence-information-macro-icon"></span>
             <div class="confluence-information-macro-body"><p>Info text</p></div>
         </div>'''
-        result = converter.preprocess_html(html)
-        assert "<blockquote>" in result
-        assert "Info text" in result
-        # No duplicate type label is prepended (the body often self-labels)
-        assert "Info:" not in result
+        md = _md(converter, html)
+        assert "::: info\n\nInfo text\n\n:::" in md
+        assert "<blockquote>" not in md
+        assert "WCEXTEND" not in md
 
-    def test_warning_panel(self, converter):
+    def test_warning_panel_maps_to_error(self, converter):
         html = '''<div class="confluence-information-macro confluence-information-macro-warning">
             <div class="confluence-information-macro-body"><p>Danger!</p></div>
         </div>'''
-        result = converter.preprocess_html(html)
-        assert "<blockquote>" in result
-        assert "Danger!" in result
-        assert "Warning:" not in result
+        md = _md(converter, html)
+        assert "::: error\n\nDanger!\n\n:::" in md
 
-    def test_note_panel(self, converter):
+    def test_note_panel_maps_to_warn(self, converter):
         html = '''<div class="confluence-information-macro confluence-information-macro-note">
             <div class="confluence-information-macro-body"><p>Remember this.</p></div>
         </div>'''
-        result = converter.preprocess_html(html)
-        assert "<blockquote>" in result
-        assert "Remember this." in result
+        md = _md(converter, html)
+        assert "::: warn\n\nRemember this.\n\n:::" in md
 
-    def test_tip_panel(self, converter):
+    def test_tip_panel_maps_to_success(self, converter):
         html = '''<div class="confluence-information-macro confluence-information-macro-tip">
             <div class="confluence-information-macro-body"><p>Pro tip!</p></div>
         </div>'''
-        result = converter.preprocess_html(html)
-        assert "<blockquote>" in result
-        assert "Pro tip!" in result
+        md = _md(converter, html)
+        assert "::: success\n\nPro tip!\n\n:::" in md
+
+    def test_panel_body_with_list_preserved(self, converter):
+        html = '''<div class="confluence-information-macro confluence-information-macro-information">
+            <div class="confluence-information-macro-body"><p>Items:</p>
+            <ul><li>one</li><li>two</li></ul></div>
+        </div>'''
+        md = _md(converter, html)
+        assert md.startswith("::: info")
+        assert "one" in md and "two" in md
+        assert md.rstrip().endswith(":::")
 
 
 class TestPreprocessCodeBlocks:
@@ -184,14 +211,14 @@ class TestPreprocessMacros:
         assert "Unsupported macro: drawio" in result
 
     def test_info_panel_not_double_processed_as_macro(self, converter):
-        """Info panels have data-macro-name but should be handled as panels, not generic macros."""
+        """Info panels have data-macro-name but should be handled as panels (callouts), not generic macros."""
         html = '''<div class="confluence-information-macro confluence-information-macro-information" data-macro-name="info">
             <div class="confluence-information-macro-body"><p>Info</p></div>
         </div>'''
         result = converter.preprocess_html(html)
-        # Should be a blockquote, not an unsupported macro comment
-        assert "<blockquote>" in result
+        # Tokenized as a callout, not turned into an unsupported-macro comment
         assert "Unsupported macro" not in result
+        assert "::: info" in converter._restore_md_tokens(result)
 
 
 class TestPreprocessUserMentions:
@@ -633,3 +660,192 @@ class TestFullConversion:
         assert "API Gateway" in md
         # No block-level headings should remain in table
         assert "<h2>" not in md
+
+
+# -- Weber-specific transforms --------------------------------------------
+
+
+class TestDrawioMermaid:
+    """draw.io <img> → ```mermaid block when a mapping exists; else PNG fallback."""
+
+    def test_mapped_image_becomes_mermaid(self, converter_weber):
+        html = '<p><img src="/wiki/download/attachments/123/CAPA.drawio.png?api=v2"/></p>'
+        md = _md(converter_weber, html)
+        assert "```mermaid\nflowchart TD\n  A-->B\n```" in md
+        assert "CAPA.drawio.png" not in md  # the image reference is gone
+
+    def test_unmapped_drawio_falls_back_to_png(self, converter_weber, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING):
+            html = '<p><img src="/wiki/download/attachments/9/Other.drawio.png"/></p>'
+            md = _md(converter_weber, html)
+        assert "![](Other.drawio.png)" in md
+        assert "```mermaid" not in md
+        assert any("No mermaid mapping" in r.message for r in caplog.records)
+
+    def test_no_mermaid_map_is_noop(self, converter):
+        html = '<p><img src="/wiki/download/attachments/123/CAPA.drawio.png"/></p>'
+        md = _md(converter, html)
+        assert "![](CAPA.drawio.png)" in md
+        assert "```mermaid" not in md
+
+    def test_page_scoped_key_disambiguates(self):
+        # Same filename on two pages → page id in the src picks the right diagram.
+        c = Converter(mermaid_map={
+            "100/Untitled Diagram.drawio.png": "flowchart TD\n  A-->B",
+            "200/Untitled Diagram.drawio.png": "flowchart TD\n  C-->D",
+        })
+        md100 = _md(c, '<p><img src="/wiki/download/attachments/100/Untitled Diagram.drawio.png"/></p>')
+        md200 = _md(c, '<p><img src="/wiki/download/attachments/200/Untitled Diagram.drawio.png"/></p>')
+        assert "A-->B" in md100 and "C-->D" not in md100
+        assert "C-->D" in md200 and "A-->B" not in md200
+
+
+class TestDrawioAttachmentOmission:
+    DRAWIO_ATTS = [
+        {"title": "CAPA.drawio", "mediaType": "application/vnd.jgraph.mxfile"},
+        {"title": "Dokumentenlenkung", "mediaType": "application/vnd.jgraph.mxfile"},
+        {"title": "~CAPA.drawio.tmp", "mediaType": "application/vnd.jgraph.mxfile"},
+        {"title": "CAPA.drawio.png", "mediaType": "image/png"},
+        {"title": "report.pdf", "mediaType": "application/pdf"},
+    ]
+
+    def test_mapped_diagram_omits_sources_and_preview(self, converter_weber):
+        # Diagram replaced by mermaid → its preview + all sources are omitted.
+        converter_weber._drawio_replaced = {"CAPA.drawio.png"}
+        omit = converter_weber._drawio_omit_names(self.DRAWIO_ATTS)
+        assert omit == {"CAPA.drawio", "Dokumentenlenkung", "~CAPA.drawio.tmp", "CAPA.drawio.png"}
+        section = converter_weber.generate_attachment_section(self.DRAWIO_ATTS, omit=omit)
+        assert "report.pdf" in section
+        assert "CAPA.drawio" not in section and "Dokumentenlenkung" not in section
+
+    def test_non_embedded_preview_is_omitted(self, converter_weber):
+        # Preview that is only an attachment (never embedded) → omitted as junk.
+        converter_weber._drawio_replaced = set()
+        converter_weber._drawio_fallback = set()
+        omit = converter_weber._drawio_omit_names(self.DRAWIO_ATTS)
+        assert "CAPA.drawio.png" in omit
+        assert {"CAPA.drawio", "Dokumentenlenkung", "~CAPA.drawio.tmp"} <= omit
+
+    def test_inline_fallback_preview_is_kept(self, converter_weber):
+        # Embedded diagram with no mermaid mapping → kept inline, NOT omitted.
+        converter_weber._drawio_fallback = {"CAPA.drawio.png"}
+        omit = converter_weber._drawio_omit_names(self.DRAWIO_ATTS)
+        assert "CAPA.drawio.png" not in omit
+        assert {"CAPA.drawio", "Dokumentenlenkung", "~CAPA.drawio.tmp"} <= omit
+
+    def test_extensionless_source_png_twin_omitted(self, converter_weber):
+        atts = [
+            {"title": "Dok", "mediaType": "application/vnd.jgraph.mxfile"},
+            {"title": "Dok.png", "mediaType": "image/png"},
+            {"title": "real-photo.png", "mediaType": "image/png"},
+        ]
+        omit = converter_weber._drawio_omit_names(atts)
+        assert "Dok" in omit and "Dok.png" in omit
+        assert "real-photo.png" not in omit  # genuine image untouched
+
+    def test_copy_attachments_skips_omitted(self, converter_weber, tmp_path):
+        src = tmp_path / "src"
+        dest = tmp_path / "dest"
+        src.mkdir()
+        for a in self.DRAWIO_ATTS:
+            (src / a["title"]).write_text("x", encoding="utf-8")
+        converter_weber._drawio_replaced = {"CAPA.drawio.png"}
+        copied = converter_weber.copy_attachments(
+            {"attachments": self.DRAWIO_ATTS}, src, dest)
+        assert copied == ["report.pdf"]
+        assert (dest / "report.pdf").exists()
+        assert not (dest / "CAPA.drawio").exists()
+
+
+class TestStaticToc:
+    TOC_HTML = (
+        "<style type='text/css'>div.rbtoc123 {padding: 0px;}</style>"
+        "<div class='toc-macro rbtoc123'><ul class='toc-indentation'>"
+        "<li><a href='#x'>Section One</a></li></ul></div>"
+    )
+
+    def test_toc_becomes_link_preview(self, converter_weber):
+        md = _md(converter_weber, self.TOC_HTML)
+        assert f"[{TOC_URL}]({TOC_URL} (preview))" in md
+        assert "Section One" not in md
+        assert "WCEXTEND" not in md
+
+    def test_toc_style_block_removed(self, converter_weber):
+        result = converter_weber.preprocess_html(self.TOC_HTML)
+        assert "rbtoc123" not in result
+        assert "<style" not in result
+
+    def test_no_toc_url_degrades(self, converter):
+        result = converter.preprocess_html(self.TOC_HTML)
+        assert "toc-macro" in result  # untouched without config
+
+
+class TestDokinfoReplace:
+    DOKINFO_HTML = (
+        "<div class='table-wrap'><table><tr><td>"
+        "<p>Dokumentenlenkung-Header content here</p></td></tr></table></div>"
+        "<p>Body stays</p>"
+    )
+
+    def test_dokinfo_becomes_link_preview(self, converter_weber):
+        md = _md(converter_weber, self.DOKINFO_HTML)
+        assert f"[{DOKINFO_URL}]({DOKINFO_URL} (preview))" in md
+        assert "Dokumentenlenkung-Header" not in md
+        assert "Body stays" in md
+
+    def test_no_config_leaves_table(self, converter):
+        result = converter.preprocess_html(self.DOKINFO_HTML)
+        assert "Dokumentenlenkung-Header" in result
+        assert "<table" in result
+
+
+class TestTokenRestore:
+    def test_token_is_alphanumeric(self, converter):
+        tok = converter._new_token()
+        assert tok.isalnum()
+        assert tok.startswith("WCEXTEND")
+
+    def test_combined_transforms_all_restored(self, converter_weber):
+        html = (
+            "<div class='table-wrap'><table><tr><td>"
+            "<p>Dokumentenlenkung-Header</p></td></tr></table></div>"
+            "<div class='confluence-information-macro confluence-information-macro-information'>"
+            "<div class='confluence-information-macro-body'><p>Hint</p></div></div>"
+            "<p><img src='/wiki/download/attachments/1/CAPA.drawio.png'/></p>"
+        )
+        md = _md(converter_weber, html)
+        assert "WCEXTEND" not in md
+        assert f"[{DOKINFO_URL}]" in md
+        assert "::: info\n\nHint\n\n:::" in md
+        assert "```mermaid" in md
+
+
+class TestWeberConfigFromEnv:
+    def test_reads_env(self, monkeypatch, tmp_path):
+        mmap = tmp_path / "m.json"
+        mmap.write_text('{"X.drawio.png": "flowchart TD\\n A-->B"}', encoding="utf-8")
+        monkeypatch.setenv("WCEXTEND_TOC_URL", "http://toc")
+        monkeypatch.setenv("WCEXTEND_DOKINFO_URL", "http://dok")
+        monkeypatch.setenv("WCEXTEND_DOKINFO_PATTERNS", "A|||B")
+        monkeypatch.setenv("WCEXTEND_MERMAID_MAP", str(mmap))
+        cfg = weber_config_from_env()
+        assert cfg["toc_url"] == "http://toc"
+        assert cfg["dokinfo_url"] == "http://dok"
+        assert cfg["dokinfo_patterns"] == ["A", "B"]
+        assert cfg["mermaid_map"]["X.drawio.png"].startswith("flowchart")
+
+    def test_absent_env_disables(self, monkeypatch, tmp_path):
+        for k in ("WCEXTEND_TOC_URL", "WCEXTEND_DOKINFO_URL", "WCEXTEND_DOKINFO_PATTERNS"):
+            monkeypatch.delenv(k, raising=False)
+        # Point the map at a non-existent path so the result is cwd-independent.
+        monkeypatch.setenv("WCEXTEND_MERMAID_MAP", str(tmp_path / "absent.json"))
+        cfg = weber_config_from_env()
+        assert cfg["toc_url"] is None and cfg["dokinfo_url"] is None
+        assert cfg["dokinfo_patterns"] == [] and cfg["mermaid_map"] == {}
+
+    def test_malformed_map_is_empty(self, monkeypatch, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        monkeypatch.setenv("WCEXTEND_MERMAID_MAP", str(bad))
+        assert weber_config_from_env()["mermaid_map"] == {}
