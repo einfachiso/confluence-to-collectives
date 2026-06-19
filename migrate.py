@@ -430,7 +430,8 @@ class Converter:
     }
 
     def __init__(self, exclude_images=False, exclude_attachments=False, strip_patterns=None,
-                 mermaid_map=None, toc_url=None, dokinfo_url=None, dokinfo_patterns=None):
+                 mermaid_map=None, toc_url=None, dokinfo_url=None, dokinfo_patterns=None,
+                 move_config=None):
         self.exclude_images = exclude_images
         self.exclude_attachments = exclude_attachments
         # Text substrings; any block (table/div/etc.) whose text contains one is
@@ -446,6 +447,9 @@ class Converter:
         self.toc_url = toc_url
         self.dokinfo_url = dokinfo_url
         self.dokinfo_patterns = [p for p in (dokinfo_patterns or []) if p]
+        # Output-tree restructuring (weber): dissolve folders / move pages to a new
+        # parent and strip a title prefix. Empty → natural tree (no-op).
+        self.move_config = move_config or {}
         # Block-level literal markdown can't survive the BeautifulSoup→html2text
         # pass, so weber transforms emit an alphanumeric sentinel token in a <p>
         # during preprocessing and swap it for the real markdown after conversion.
@@ -925,6 +929,82 @@ class Converter:
                 counter += 1
         return name
 
+    def _apply_move_config(self, pages, children_map, root_pages, homepage_id):
+        """Restructure the page tree per self.move_config (mutates children_map).
+
+        Config keys (all title-paths, each a list of titles from a top-level node):
+          strip_title_prefix : prefix removed from relocated pages' titles/names
+          dissolve_folders   : [{folder, into}] move all children of `folder` under
+                               `into`, then drop the now-empty `folder`
+          move_pages         : [{page, into}] move one page (subtree) under `into`
+          remove_folders     : [path] drop these nodes entirely
+
+        Returns (drop_set, title_map). No-op (empty config) leaves the tree intact.
+        """
+        cfg = self.move_config
+        if not cfg:
+            return set(), {}
+        strip = cfg.get("strip_title_prefix", "")
+
+        def resolve(path):
+            level = list(children_map.get(homepage_id, []))
+            level += [r for r in root_pages if r != homepage_id]
+            cur = None
+            for seg in path or []:
+                cur = next((pid for pid in level
+                            if pages.get(pid, {}).get("title") == seg), None)
+                if cur is None:
+                    return None
+                level = children_map.get(cur, [])
+            return cur
+
+        reparent, relocated, drop = {}, set(), set()
+
+        for d in cfg.get("dissolve_folders", []):
+            fpid, tpid = resolve(d.get("folder")), resolve(d.get("into"))
+            if not fpid or not tpid:
+                log.warning("Move: unresolved dissolve %s -> %s", d.get("folder"), d.get("into"))
+                continue
+            for c in list(children_map.get(fpid, [])):
+                reparent[c] = tpid
+                relocated.add(c)
+            drop.add(fpid)
+
+        for m in cfg.get("move_pages", []):
+            ppid, tpid = resolve(m.get("page")), resolve(m.get("into"))
+            if not ppid or not tpid:
+                log.warning("Move: unresolved move %s -> %s", m.get("page"), m.get("into"))
+                continue
+            reparent[ppid] = tpid
+            relocated.add(ppid)
+
+        for rp in cfg.get("remove_folders", []):
+            pid = resolve(rp)
+            if pid:
+                drop.add(pid)
+            else:
+                log.warning("Move: unresolved remove %s", rp)
+
+        # Reparent, then drop — applied after all paths are resolved.
+        for child, new_parent in reparent.items():
+            for plist in children_map.values():
+                if child in plist:
+                    plist.remove(child)
+            children_map.setdefault(new_parent, []).append(child)
+        for d in drop:
+            children_map.pop(d, None)
+            for plist in children_map.values():
+                if d in plist:
+                    plist.remove(d)
+
+        title_map = {}
+        if strip:
+            for pid in relocated:
+                t = pages.get(pid, {}).get("title", "")
+                if t.startswith(strip):
+                    title_map[pid] = t[len(strip):]
+        return drop, title_map
+
     def build_output_tree(self, state):
         """Build mapping of page_id → output path relative to space root.
 
@@ -948,12 +1028,17 @@ class Converter:
             else:
                 root_pages.append(pid)
 
-        # Determine which pages have children (in our page set)
-        has_children = set(children_map.keys())
-
         # Find homepage: root page with most children, or first root page
         if root_pages:
             homepage_id = max(root_pages, key=lambda pid: len(children_map.get(pid, [])))
+
+        # Apply configured restructuring (weber): dissolve folders / move pages to
+        # a new parent, drop nodes, strip a title prefix. No-op when unconfigured.
+        drop, title_map = self._apply_move_config(
+            pages, children_map, root_pages, homepage_id)
+
+        # Determine which pages have children (after restructuring)
+        has_children = {k for k, v in children_map.items() if v}
 
         output = {}
         used_names = {}  # dir_path → set of names used
@@ -961,8 +1046,10 @@ class Converter:
         def assign_paths(page_ids, dir_prefix):
             used_names.setdefault(dir_prefix, set())
             for pid in page_ids:
+                if pid in drop:
+                    continue
                 p = pages[pid]
-                title = p.get("title", "untitled")
+                title = title_map.get(pid, p.get("title", "untitled"))
 
                 if pid == homepage_id and dir_prefix == "":
                     # Homepage → root Readme.md
@@ -1238,6 +1325,24 @@ def _load_mermaid_map(path):
     return {}
 
 
+def _load_moves(path):
+    """Load the output-tree restructuring config (JSON); tolerate missing/malformed."""
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("Could not read moves file %s: %s", path, e)
+        return {}
+    if isinstance(data, dict):
+        return data
+    log.warning("Moves file %s is not a JSON object; ignoring", path)
+    return {}
+
+
 def weber_config_from_env():
     """Weber-specific Converter kwargs from env. Every value is optional; absent
     values disable the corresponding transform, so non-weber runs are unaffected.
@@ -1245,6 +1350,7 @@ def weber_config_from_env():
       WCEXTEND_DOKINFO_URL      document-header table → link preview
       WCEXTEND_DOKINFO_PATTERNS ||| separated text substrings identifying it
       WCEXTEND_MERMAID_MAP      path to the draw.io→mermaid JSON (default mermaid-map.json)
+      WEBER_MOVES_FILE          path to the tree-restructuring JSON (default weber-moves.json)
     """
     raw_patterns = os.getenv("WCEXTEND_DOKINFO_PATTERNS", "")
     return {
@@ -1252,6 +1358,7 @@ def weber_config_from_env():
         "dokinfo_url": os.getenv("WCEXTEND_DOKINFO_URL") or None,
         "dokinfo_patterns": [p.strip() for p in raw_patterns.split("|||") if p.strip()],
         "mermaid_map": _load_mermaid_map(os.getenv("WCEXTEND_MERMAID_MAP", "mermaid-map.json")),
+        "move_config": _load_moves(os.getenv("WEBER_MOVES_FILE", "weber-moves.json")),
     }
 
 

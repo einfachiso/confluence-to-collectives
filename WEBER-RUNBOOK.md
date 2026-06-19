@@ -125,6 +125,22 @@ Seite (Storage-Format)
 
 ---
 
+## 4b. Umstrukturierung (Drafts → Vorgabedokumente)
+
+Weber-spezifisch werden die Draft-Dokumente beim Convert in die Zielstruktur
+verschoben — gesteuert über **`weber-moves.json`** (Pfad via `WEBER_MOVES_FILE`,
+Default `weber-moves.json`), angewendet in `Converter.build_output_tree`:
+
+- `Drafts/Draft Prozesse/*` → `Vorgabedokumente/Prozesse/`
+- `Drafts/Draft Richtlinien/*` → `Vorgabedokumente/Richtlinien/`
+- lose Draft-Seiten → `Vorgabedokumente/`
+- `[DRAFT] `-Präfix wird aus Titel/Dateiname entfernt, der leere `Drafts`-Baum entfällt
+
+Die Konfiguration nutzt **Titel-Pfade** (Liste von Titeln ab einer Top-Ebene). Interne
+Links bleiben automatisch korrekt: `cpage:<id>`-Platzhalter werden beim Upload anhand der
+neuen Routen aufgelöst (relative Links passen sich der neuen Tiefe an). Kein Neu-Export
+nötig — nur erneut **convert + upload** (Abschnitt 3).
+
 ## 5. Verifikation nach dem Import
 
 - Seitenzahl, Mermaid-Seiten und „keine draw.io-Artefakte" prüfen (PROPFIND/Skript).

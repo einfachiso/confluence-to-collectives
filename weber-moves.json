@@ -1,0 +1,15 @@
+{
+  "_comment": "Weber output-tree restructuring. Paths are title-paths from a top-level node (a child of the space homepage). Consumed by Converter.build_output_tree via WEBER_MOVES_FILE.",
+  "strip_title_prefix": "[DRAFT] ",
+  "dissolve_folders": [
+    {"folder": ["Drafts", "Draft Prozesse"], "into": ["Vorgabedokumente", "Prozesse"]},
+    {"folder": ["Drafts", "Draft Richtlinien"], "into": ["Vorgabedokumente", "Richtlinien"]}
+  ],
+  "move_pages": [
+    {"page": ["Drafts", "[DRAFT] Informationssicherheitsleitlinie"], "into": ["Vorgabedokumente"]},
+    {"page": ["Drafts", "[DRAFT] Informationssicherheitsziele und KPIs"], "into": ["Vorgabedokumente"]}
+  ],
+  "remove_folders": [
+    ["Drafts"]
+  ]
+}

@@ -849,3 +849,54 @@ class TestWeberConfigFromEnv:
         bad.write_text("{not json", encoding="utf-8")
         monkeypatch.setenv("WCEXTEND_MERMAID_MAP", str(bad))
         assert weber_config_from_env()["mermaid_map"] == {}
+
+
+class TestMoveConfig:
+    """Output-tree restructuring (dissolve folders / move pages / strip prefix)."""
+
+    PAGES = [
+        {"page_id": "1", "title": "Home", "space_key": "SP", "parent_id": None},
+        {"page_id": "2", "title": "Drafts", "space_key": "SP", "parent_id": "1"},
+        {"page_id": "3", "title": "Draft Prozesse", "space_key": "SP", "parent_id": "2"},
+        {"page_id": "4", "title": "[DRAFT] Prozess CAPA", "space_key": "SP", "parent_id": "3"},
+        {"page_id": "5", "title": "[DRAFT] Leitlinie", "space_key": "SP", "parent_id": "2"},
+        {"page_id": "6", "title": "Vorgabedokumente", "space_key": "SP", "parent_id": "1"},
+        {"page_id": "7", "title": "Prozesse", "space_key": "SP", "parent_id": "6"},
+    ]
+    MOVES = {
+        "strip_title_prefix": "[DRAFT] ",
+        "dissolve_folders": [
+            {"folder": ["Drafts", "Draft Prozesse"], "into": ["Vorgabedokumente", "Prozesse"]}
+        ],
+        "move_pages": [
+            {"page": ["Drafts", "[DRAFT] Leitlinie"], "into": ["Vorgabedokumente"]}
+        ],
+        "remove_folders": [["Drafts"]],
+    }
+
+    def _state(self, tmp_path):
+        from migrate import MigrationState
+        s = MigrationState(path=tmp_path / ".migration-state.json")
+        for p in self.PAGES:
+            s.set_page(p["page_id"], p)
+        return s
+
+    def test_restructure(self, tmp_path):
+        from migrate import Converter
+        tree = Converter(move_config=self.MOVES).build_output_tree(self._state(tmp_path))
+        # relocated + prefix stripped
+        assert tree["4"]["path"] == "Vorgabedokumente/Prozesse/Prozess CAPA.md"
+        # the former leaf "Prozesse" is now a folder page
+        assert tree["7"]["path"] == "Vorgabedokumente/Prozesse/Readme.md"
+        # loose page moved directly under Vorgabedokumente, prefix stripped
+        assert tree["5"]["path"] == "Vorgabedokumente/Leitlinie.md"
+        # dropped folders are gone
+        assert "2" not in tree and "3" not in tree
+        # no [DRAFT] anywhere
+        assert not any("[DRAFT]" in v["path"] for v in tree.values())
+
+    def test_noop_without_config(self, tmp_path):
+        from migrate import Converter
+        tree = Converter().build_output_tree(self._state(tmp_path))
+        assert any("Drafts" in v["path"] for v in tree.values())  # tree unchanged
+        assert tree["4"]["path"].endswith("[DRAFT] Prozess CAPA.md")
