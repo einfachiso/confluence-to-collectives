@@ -177,64 +177,55 @@ def convert_file(path, direction="TD"):
 
 
 # --------------------------------------------------------------------------
-# Scanning / CLI
+# Map building (from the export manifest) / CLI
 # --------------------------------------------------------------------------
 
-def _looks_like_mxfile(path):
-    """True if a file (used for extension-less sources) sniffs as mxGraph XML."""
-    try:
-        head = path.read_text(encoding="utf-8", errors="ignore")[:200].lstrip()
-    except OSError:
-        return False
-    return head.startswith("<mxfile") or head.startswith("<mxGraphModel")
+def diagram_key(page_id, diagram_name):
+    """Map key = the rendered image the page embeds: ``<page-id>/<diagramName>.png``.
 
-
-def find_source_files(input_dir):
-    """draw.io source files under input_dir: ``*.drawio`` plus extension-less
-    mxGraph sources. Skips ``~…`` autosave and ``.tmp`` files."""
-    root = Path(input_dir)
-    found = []
-    for p in sorted(root.rglob("*")):
-        if not p.is_file() or p.name.startswith("~"):
-            continue
-        if p.suffix.lower() == ".tmp":
-            continue
-        if p.suffix.lower() == ".drawio":
-            found.append(p)
-        elif p.suffix == "" and _looks_like_mxfile(p):
-            found.append(p)
-    return found
-
-
-def image_key(path):
-    """Page-scoped rendered-image key for a source file: ``<page-id>/<name>.png``.
-
-    Attachments live in ``…/attachments/<page-id>/<name>.drawio``, so the parent
-    directory name is the Confluence page id. The same diagram filename recurs
-    across pages with different content, so the page id is needed to disambiguate;
-    migrate.py builds the identical key from the page's `<img>` src URL.
+    migrate.py builds the identical key from each page's `<img>` src
+    (``/attachments/<page-id>/<diagramName>.png``), so the lookup matches by the
+    authoritative diagram name, not by the source file name (which is unreliable).
     """
-    return f"{path.parent.name}/{path.name}.png"
+    return f"{page_id}/{diagram_name}.png"
 
 
-def build_map(input_dir, direction="TD"):
-    """Return {<page-id>/<image_filename>: mermaid_text} for every convertible source."""
+def build_map(export_dir, direction="TD"):
+    """Build {<page-id>/<diagramName>.png: mermaid_text} from an export directory.
+
+    Reads each ``pages/*.json`` and its ``diagrams`` manifest (written by
+    `migrate.py export`, resolved via the authoritative storage-macro linkage),
+    converting each referenced source mxfile.
+    """
+    export_dir = Path(export_dir)
+    pages_dir = export_dir / "pages"
     result = {}
-    for src in find_source_files(input_dir):
-        mermaid = convert_file(src, direction=direction)
-        key = image_key(src)
-        if mermaid:
-            result[key] = mermaid
-            log.info("Converted %s -> %s", src.name, key)
-        else:
-            log.warning("Skipped (empty/unconvertible): %s", src.name)
+    for page_json in sorted(pages_dir.glob("*.json")):
+        page = json.loads(page_json.read_text(encoding="utf-8"))
+        page_id = str(page.get("page_id", page_json.stem))
+        for dia in page.get("diagrams", []):
+            name, src = dia.get("diagram_name"), dia.get("source")
+            if not name or not src:
+                continue
+            source_path = export_dir / src
+            if not source_path.exists():
+                log.warning("Source missing for %r (page %s): %s", name, page_id, src)
+                continue
+            mermaid = convert_file(source_path, direction=direction)
+            key = diagram_key(page_id, name)
+            if mermaid:
+                result[key] = mermaid
+                log.info("Converted %r -> %s", name, key)
+            else:
+                log.warning("Skipped (empty/unconvertible): %r (page %s)", name, page_id)
     return result
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Convert draw.io diagrams to a mermaid JSON map (FlowForge).")
-    parser.add_argument("--input-dir", default=".",
-                        help="Directory to scan recursively for .drawio sources (default: .).")
+    parser = argparse.ArgumentParser(
+        description="Build a mermaid JSON map from an export dir (FlowForge).")
+    parser.add_argument("--export-dir", required=True,
+                        help="Export directory, e.g. export_data/ISMS2022DE (contains pages/ and diagrams/).")
     parser.add_argument("--out", default="mermaid-map.json",
                         help="Output JSON map path (default: mermaid-map.json).")
     parser.add_argument("--direction", default="TD",
@@ -245,7 +236,7 @@ def main(argv=None):
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(levelname)s %(message)s")
 
-    mapping = build_map(args.input_dir, direction=args.direction)
+    mapping = build_map(args.export_dir, direction=args.direction)
     Path(args.out).write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info("Wrote %d diagram(s) to %s", len(mapping), args.out)
     return 0

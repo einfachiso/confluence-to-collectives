@@ -3,6 +3,7 @@
 
 __version__ = "0.6.0"
 
+import html
 import json
 import logging
 import os
@@ -316,6 +317,93 @@ class ConfluenceClient:
                     fallback_url = f"/wiki{fallback_url}"
                 return self._request("GET", fallback_url).content
             raise
+
+    # -- draw.io diagrams -------------------------------------------------
+
+    # A page's draw.io diagram is rendered to a `<diagramName>.png` image in
+    # export_view, but the editable source is reached only via the STORAGE-format
+    # macro: it carries `diagramName` (= the rendered image's base name) and
+    # `custContentId` (the draw.io custom-content entity). The custom content's
+    # `pageId` is the page that actually holds the source attachment (it can
+    # differ from the embedding page when a diagram is reused). The source itself
+    # is the page attachment flagged with comment "draw.io Diagramm". This
+    # linkage is authoritative; attachment file names are not (they are often
+    # renamed, stale or — for reused diagrams — a corrupt local copy).
+    DRAWIO_MACRO_RE = re.compile(
+        r'<ac:structured-macro[^>]*ac:name="drawio".*?</ac:structured-macro>', re.S)
+    DRAWIO_SOURCE_COMMENT = "draw.io Diagramm"
+    DRAWIO_MXFILE_MEDIA = "application/vnd.jgraph.mxfile"
+
+    def get_page_storage(self, page_id):
+        """Storage-format body of a page (contains the draw.io macros)."""
+        data = self._get_json(f"/wiki/api/v2/pages/{page_id}", **{"body-format": "storage"})
+        return (data.get("body", {}).get("storage", {}) or {}).get("value", "") or ""
+
+    def extract_drawio_macros(self, storage_html):
+        """Return [{diagram_name, cust_content_id}] for each draw.io macro."""
+        out = []
+        for m in self.DRAWIO_MACRO_RE.finditer(storage_html or ""):
+            seg = m.group(0)
+            dn = re.search(r'ac:name="diagramName">(.*?)</ac:parameter>', seg, re.S)
+            cc = re.search(r'ac:name="custContentId">(.*?)</ac:parameter>', seg, re.S)
+            out.append({
+                "diagram_name": html.unescape(dn.group(1)) if dn else None,
+                "cust_content_id": cc.group(1).strip() if cc else None,
+            })
+        return out
+
+    def get_custom_content(self, cc_id):
+        return self._get_json(f"/wiki/api/v2/custom-content/{cc_id}")
+
+    def _attachments_with_metadata(self, page_id):
+        """v1 attachment list (carries metadata.comment, which v2 omits)."""
+        data = self._get_json(
+            f"/wiki/rest/api/content/{page_id}/child/attachment",
+            expand="metadata", limit=200)
+        return data.get("results", [])
+
+    @staticmethod
+    def _attachment_media(a):
+        return (a.get("metadata", {}).get("mediaType")
+                or a.get("extensions", {}).get("mediaType") or "")
+
+    def fetch_drawio_source(self, embedding_page_id, macro):
+        """Resolve and download the authoritative source mxfile for one macro.
+
+        Returns the file bytes, or None if it cannot be resolved."""
+        diagram_name = macro.get("diagram_name")
+        cc_id = macro.get("cust_content_id")
+        origin_page = embedding_page_id
+        cc_title = None
+        if cc_id:
+            try:
+                cc = self.get_custom_content(cc_id)
+                origin_page = str(cc.get("pageId") or embedding_page_id)
+                cc_title = cc.get("title")
+            except Exception as e:
+                log.warning("Custom content %s lookup failed: %s", cc_id, e)
+
+        atts = self._attachments_with_metadata(origin_page)
+        sources = [a for a in atts
+                   if a.get("metadata", {}).get("comment") == self.DRAWIO_SOURCE_COMMENT
+                   or self._attachment_media(a) == self.DRAWIO_MXFILE_MEDIA]
+        if not sources:
+            return None
+
+        # Pair the macro to its source: prefer a title match (diagram name or the
+        # custom-content title, with/without a .drawio suffix); else, if the page
+        # has exactly one source, use it; otherwise give up (logged by caller).
+        candidates = {n for n in (diagram_name, cc_title) if n}
+        candidates |= {n[:-len(".drawio")] for n in list(candidates) if n.endswith(".drawio")}
+        candidates |= {n + ".drawio" for n in list(candidates)}
+        pick = next((a for a in sources if a.get("title") in candidates), None)
+        if pick is None and len(sources) == 1:
+            pick = sources[0]
+        if pick is None:
+            return None
+
+        fallback = pick.get("_links", {}).get("download") or pick.get("downloadLink")
+        return self.download_attachment(origin_page, pick["id"], fallback_url=fallback)
 
 
 # ---------------------------------------------------------------------------
@@ -1454,6 +1542,37 @@ def export(space_key, pages, all_spaces, exclude_images, exclude_attachments, dr
                     except Exception as e:
                         log.warning("Failed to fetch attachments for page %s: %s", page_id, e)
 
+                # Resolve draw.io diagrams via the authoritative storage-macro
+                # linkage (diagramName + custContentId → real source mxfile), and
+                # save each source for the offline mermaid converter. Keyed by the
+                # rendered image name the page embeds: "<diagramName>.png".
+                diagrams = []
+                if not exclude_images:
+                    try:
+                        macros = client.extract_drawio_macros(client.get_page_storage(page_id))
+                        for idx, mac in enumerate(macros):
+                            dname = mac.get("diagram_name")
+                            if not dname:
+                                continue
+                            try:
+                                data = client.fetch_drawio_source(page_id, mac)
+                            except Exception as e:
+                                log.warning("draw.io source fetch failed (%s, page %s): %s",
+                                            dname, page_id, e)
+                                data = None
+                            if not data:
+                                log.warning("Unresolved draw.io source: %r on page %s",
+                                            dname, page_id)
+                                continue
+                            dia_dir = export_base / "diagrams" / page_id
+                            dia_dir.mkdir(parents=True, exist_ok=True)
+                            src_rel = f"diagrams/{page_id}/{idx}.drawio"
+                            (export_base / src_rel).write_bytes(data)
+                            diagrams.append({"diagram_name": dname, "source": src_rel})
+                    except Exception as e:
+                        log.warning("draw.io diagram resolution failed for page %s: %s",
+                                    page_id, e)
+
                 # Save page data
                 page_data = {
                     "page_id": page_id,
@@ -1464,6 +1583,7 @@ def export(space_key, pages, all_spaces, exclude_images, exclude_attachments, dr
                     "body": body_html,
                     "comments": comments,
                     "attachments": attachments,
+                    "diagrams": diagrams,
                 }
 
                 pages_dir = export_base / "pages"

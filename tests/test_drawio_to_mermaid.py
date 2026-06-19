@@ -1,5 +1,7 @@
 """Tests for the FlowForge-based drawio_to_mermaid converter."""
 
+import json
+
 import pytest
 
 pytest.importorskip("flowforge", reason="FlowForge not installed (pip install ./tools/FlowForge)")
@@ -106,36 +108,38 @@ class TestConvert:
         assert '["why"]' not in mm              # not emitted as a floating node
 
 
-class TestScanAndKeys:
-    def test_image_key_is_page_scoped(self, tmp_path):
-        page = tmp_path / "465895772"
-        page.mkdir()
-        assert d2m.image_key(page / "Foo.drawio") == "465895772/Foo.drawio.png"
-        assert d2m.image_key(page / "Bar") == "465895772/Bar.png"
+def _make_export(tmp_path, page_id, diagrams):
+    """Build a minimal export dir: pages/<id>.json + diagrams/<id>/<n>.drawio.
+    `diagrams` = list of (diagram_name, drawio_xml)."""
+    (tmp_path / "pages").mkdir(exist_ok=True)
+    manifest = []
+    for i, (name, xml) in enumerate(diagrams):
+        rel = f"diagrams/{page_id}/{i}.drawio"
+        (tmp_path / "diagrams" / page_id).mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(xml, encoding="utf-8")
+        manifest.append({"diagram_name": name, "source": rel})
+    (tmp_path / "pages" / f"{page_id}.json").write_text(
+        json.dumps({"page_id": page_id, "diagrams": manifest}), encoding="utf-8")
 
-    def test_find_sources_filters(self, tmp_path):
-        (tmp_path / "A.drawio").write_text(SWIMLANE, encoding="utf-8")
-        (tmp_path / "~A.drawio.tmp").write_text(SWIMLANE, encoding="utf-8")
-        (tmp_path / "B").write_text("<mxfile></mxfile>", encoding="utf-8")
-        (tmp_path / "notes.txt").write_text("hello", encoding="utf-8")
-        names = {p.name for p in d2m.find_source_files(tmp_path)}
-        assert names == {"A.drawio", "B"}
 
-    def test_build_map_keys_page_scoped(self, tmp_path):
-        page = tmp_path / "999"
-        page.mkdir()
-        (page / "Flow.drawio").write_text(SWIMLANE, encoding="utf-8")
-        (page / "Empty.drawio").write_text(EMPTY, encoding="utf-8")
+class TestBuildMap:
+    def test_key_is_diagram_name_based(self, tmp_path):
+        # source file name differs from diagramName → key uses diagramName
+        _make_export(tmp_path, "138", [("Vorfallmanagement und CAPA", SWIMLANE)])
         mapping = d2m.build_map(tmp_path)
-        assert "999/Flow.drawio.png" in mapping
-        assert mapping["999/Flow.drawio.png"].startswith("flowchart TD")
-        assert "999/Empty.drawio.png" not in mapping  # empty diagrams skipped
+        assert "138/Vorfallmanagement und CAPA.png" in mapping
+        assert mapping["138/Vorfallmanagement und CAPA.png"].startswith("flowchart TD")
+
+    def test_empty_diagram_skipped(self, tmp_path):
+        _make_export(tmp_path, "1", [("Leer", EMPTY)])
+        assert d2m.build_map(tmp_path) == {}
 
     def test_same_name_different_pages_no_collision(self, tmp_path):
-        for pid in ("100", "200"):
-            d = tmp_path / pid
-            d.mkdir()
-            (d / "Untitled Diagram.drawio").write_text(SWIMLANE, encoding="utf-8")
+        _make_export(tmp_path, "100", [("Untitled Diagram", SWIMLANE)])
+        _make_export(tmp_path, "200", [("Untitled Diagram", SWIMLANE)])
         mapping = d2m.build_map(tmp_path)
-        assert "100/Untitled Diagram.drawio.png" in mapping
-        assert "200/Untitled Diagram.drawio.png" in mapping
+        assert "100/Untitled Diagram.png" in mapping
+        assert "200/Untitled Diagram.png" in mapping
+
+    def test_diagram_key_helper(self):
+        assert d2m.diagram_key("138", "Vorfallmanagement und CAPA") == "138/Vorfallmanagement und CAPA.png"
