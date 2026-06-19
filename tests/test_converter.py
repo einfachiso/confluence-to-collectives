@@ -734,6 +734,21 @@ class TestDrawioAttachmentOmission:
         assert "CAPA.drawio.png" not in omit
         assert {"CAPA.drawio", "Dokumentenlenkung", "~CAPA.drawio.tmp"} <= omit
 
+    def test_replaced_preview_with_mismatched_name_omitted(self, converter_weber):
+        # Rendered preview whose name differs from the source mxfile — only
+        # _drawio_replaced (the embedded filename) identifies it.
+        atts = [
+            {"title": "Prozess Informationssicherheitsereignis und -vorfall",
+             "mediaType": "application/vnd.jgraph.mxfile"},
+            {"title": "Vorfallmanagement und CAPA.png", "mediaType": "image/png"},
+            {"title": "echtes-bild.png", "mediaType": "image/png"},
+        ]
+        converter_weber._drawio_replaced = {"Vorfallmanagement und CAPA.png"}
+        omit = converter_weber._drawio_omit_names(atts)
+        assert "Vorfallmanagement und CAPA.png" in omit
+        assert "Prozess Informationssicherheitsereignis und -vorfall" in omit
+        assert "echtes-bild.png" not in omit  # genuine screenshot kept
+
     def test_extensionless_source_png_twin_omitted(self, converter_weber):
         atts = [
             {"title": "Dok", "mediaType": "application/vnd.jgraph.mxfile"},

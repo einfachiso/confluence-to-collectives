@@ -809,12 +809,15 @@ class Converter:
 
           * sources / autosave — mediaType application/vnd.jgraph.mxfile (covers
             `<name>.drawio`, extension-less sources, and `~…tmp`)
-          * rendered previews — `<name>.drawio.png`, plus the `<name>.png` twin of
-            an extension-less mxfile source on the same page
+          * previews replaced by mermaid — the embedded image filename recorded in
+            `_drawio_replaced` (authoritative; the preview name often differs from
+            the source name, e.g. "Vorfallmanagement und CAPA.png")
+          * other rendered previews — `<name>.drawio.png`, plus the `<name>.png`
+            twin of an extension-less mxfile source on the same page
         """
         mxfile = {a.get("title", "") for a in attachments
                   if a.get("mediaType") == "application/vnd.jgraph.mxfile"}
-        omit = set(mxfile)
+        omit = set(mxfile) | set(self._drawio_replaced)
         for a in attachments:
             t = a.get("title", "")
             is_preview = t.endswith(".drawio.png") or (t.endswith(".png") and t[:-4] in mxfile)
