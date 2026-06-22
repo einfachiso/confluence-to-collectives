@@ -365,6 +365,11 @@ class Converter:
         # Drop configured boilerplate blocks (e.g. a per-page copyright box)
         self._strip_configured_content(soup)
 
+        # Status macros (lozenges, e.g. "IN ARBEIT" / "ABGELEHNT") → inline code.
+        # Runs early so status keywords inside panels and table cells are caught
+        # before those blocks are flattened/converted.
+        self._replace_status_macros(soup)
+
         # Remove leading <hr> tags — html2text converts them to "---" which
         # Nextcloud Collectives misinterprets as YAML front matter
         for el in soup.find_all("hr"):
@@ -529,6 +534,22 @@ class Converter:
                     continue
                 removed.add(id(target))
                 target.decompose()
+
+    def _replace_status_macros(self, soup):
+        """Confluence status macros render as a lozenge span in export_view
+        (`<span class="status-macro aui-lozenge …">IN ARBEIT</span>`). Collectives
+        has no equivalent, so turn each into an inline `<code>` element — html2text
+        emits it as backtick-wrapped inline code (e.g. `IN ARBEIT`), keeping the
+        keyword visually distinct.
+        """
+        for span in soup.find_all("span", class_="status-macro"):
+            text = span.get_text(strip=True)
+            if not text:
+                span.decompose()
+                continue
+            code = soup.new_tag("code")
+            code.string = text
+            span.replace_with(code)
 
     def _replace_unsupported_macro(self, soup, macro, name):
         """Drop an unsupported macro, but lift out any rendered <img> it wraps.

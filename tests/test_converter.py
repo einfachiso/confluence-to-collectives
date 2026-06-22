@@ -172,6 +172,24 @@ class TestPreprocessCodeBlocks:
         assert "some code" in result
 
 
+class TestPreprocessStatusMacros:
+    def test_status_macro_becomes_code(self, converter):
+        html = '<p>Status: <span class="status-macro aui-lozenge aui-lozenge-current">IN ARBEIT</span></p>'
+        result = converter.preprocess_html(html)
+        assert "<code>IN ARBEIT</code>" in result
+
+    def test_status_macro_inline_code_markdown(self, converter):
+        html = '<p>Status: <span class="status-macro aui-lozenge aui-lozenge-error">ABGELEHNT</span></p>'
+        md = converter.html_to_markdown(converter.preprocess_html(html))
+        assert "`ABGELEHNT`" in md
+
+    def test_empty_status_macro_removed(self, converter):
+        html = '<p>x<span class="status-macro aui-lozenge"></span>y</p>'
+        result = converter.preprocess_html(html)
+        assert "status-macro" not in result
+        assert "<code>" not in result
+
+
 class TestPreprocessMacros:
     def test_unsupported_structured_macro(self, converter):
         html = '<ac:structured-macro ac:name="jira"><ac:parameter ac:name="key">PROJ-1</ac:parameter></ac:structured-macro>'
