@@ -13,7 +13,6 @@ def converter():
 
 
 TOC_URL = "https://nc.example/index.php/apps/wcextend/smartpicker/wcextend-toc"
-DOKINFO_URL = "https://nc.example/index.php/apps/wcextend/smartpicker/wcextend-isms-dokinfo-prozess"
 
 
 @pytest.fixture
@@ -21,7 +20,6 @@ def converter_weber():
     return Converter(
         mermaid_map={"CAPA.drawio.png": "flowchart TD\n  A-->B"},
         toc_url=TOC_URL,
-        dokinfo_url=DOKINFO_URL,
         dokinfo_patterns=["Dokumentenlenkung-Header"],
     )
 
@@ -814,17 +812,18 @@ class TestStaticToc:
         assert "toc-macro" in result  # untouched without config
 
 
-class TestDokinfoReplace:
+class TestDokinfoRemove:
     DOKINFO_HTML = (
         "<div class='table-wrap'><table><tr><td>"
         "<p>Dokumentenlenkung-Header content here</p></td></tr></table></div>"
         "<p>Body stays</p>"
     )
 
-    def test_dokinfo_becomes_link_preview(self, converter_weber):
+    def test_dokinfo_removed(self, converter_weber):
         md = _md(converter_weber, self.DOKINFO_HTML)
-        assert f"[{DOKINFO_URL}]({DOKINFO_URL} (preview))" in md
+        # Header table is dropped, not replaced with anything
         assert "Dokumentenlenkung-Header" not in md
+        assert "wcextend" not in md
         assert "Body stays" in md
 
     def test_no_config_leaves_table(self, converter):
@@ -849,7 +848,7 @@ class TestTokenRestore:
         )
         md = _md(converter_weber, html)
         assert "WCEXTEND" not in md
-        assert f"[{DOKINFO_URL}]" in md
+        assert "Dokumentenlenkung-Header" not in md  # header removed, not replaced
         assert "::: info\n\nHint\n\n:::" in md
         assert "```mermaid" in md
 
@@ -859,22 +858,20 @@ class TestWeberConfigFromEnv:
         mmap = tmp_path / "m.json"
         mmap.write_text('{"X.drawio.png": "flowchart TD\\n A-->B"}', encoding="utf-8")
         monkeypatch.setenv("WCEXTEND_TOC_URL", "http://toc")
-        monkeypatch.setenv("WCEXTEND_DOKINFO_URL", "http://dok")
         monkeypatch.setenv("WCEXTEND_DOKINFO_PATTERNS", "A|||B")
         monkeypatch.setenv("WCEXTEND_MERMAID_MAP", str(mmap))
         cfg = weber_config_from_env()
         assert cfg["toc_url"] == "http://toc"
-        assert cfg["dokinfo_url"] == "http://dok"
         assert cfg["dokinfo_patterns"] == ["A", "B"]
         assert cfg["mermaid_map"]["X.drawio.png"].startswith("flowchart")
 
     def test_absent_env_disables(self, monkeypatch, tmp_path):
-        for k in ("WCEXTEND_TOC_URL", "WCEXTEND_DOKINFO_URL", "WCEXTEND_DOKINFO_PATTERNS"):
+        for k in ("WCEXTEND_TOC_URL", "WCEXTEND_DOKINFO_PATTERNS"):
             monkeypatch.delenv(k, raising=False)
         # Point the map at a non-existent path so the result is cwd-independent.
         monkeypatch.setenv("WCEXTEND_MERMAID_MAP", str(tmp_path / "absent.json"))
         cfg = weber_config_from_env()
-        assert cfg["toc_url"] is None and cfg["dokinfo_url"] is None
+        assert cfg["toc_url"] is None
         assert cfg["dokinfo_patterns"] == [] and cfg["mermaid_map"] == {}
 
     def test_malformed_map_is_empty(self, monkeypatch, tmp_path):

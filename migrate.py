@@ -430,7 +430,7 @@ class Converter:
     }
 
     def __init__(self, exclude_images=False, exclude_attachments=False, strip_patterns=None,
-                 mermaid_map=None, toc_url=None, dokinfo_url=None, dokinfo_patterns=None,
+                 mermaid_map=None, toc_url=None, dokinfo_patterns=None,
                  move_config=None):
         self.exclude_images = exclude_images
         self.exclude_attachments = exclude_attachments
@@ -441,11 +441,10 @@ class Converter:
         # Weber-specific (config-driven; absent values disable the transform):
         #   mermaid_map     {image_filename: mermaid_text} — draw.io <img> → ```mermaid block
         #   toc_url         wcextend smartpicker URL — replaces a static TOC macro
-        #   dokinfo_url     wcextend smartpicker URL — replaces the document-header table
-        #   dokinfo_patterns text substrings identifying that header table
+        #   dokinfo_patterns text substrings identifying the document-header table,
+        #                   which is removed (not replaced)
         self.mermaid_map = mermaid_map or {}
         self.toc_url = toc_url
-        self.dokinfo_url = dokinfo_url
         self.dokinfo_patterns = [p for p in (dokinfo_patterns or []) if p]
         # Output-tree restructuring (weber): dissolve folders / move pages to a new
         # parent and strip a title prefix. Empty → natural tree (no-op).
@@ -498,10 +497,10 @@ class Converter:
         # before those blocks are flattened/converted.
         self._replace_status_macros(soup)
 
-        # Replace the document-header (dokinfo) table with a wcextend link preview.
-        # Runs before the table-cell flatten step below so the header cells aren't
-        # mangled first. No-op unless dokinfo_url + dokinfo_patterns are configured.
-        self._replace_dokinfo(soup)
+        # Remove the document-header (dokinfo) table. Runs before the table-cell
+        # flatten step below so the header cells aren't mangled first. No-op unless
+        # dokinfo_patterns are configured.
+        self._remove_dokinfo(soup)
 
         # Remove leading <hr> tags — html2text converts them to "---" which
         # Nextcloud Collectives misinterprets as YAML front matter
@@ -762,11 +761,11 @@ class Converter:
         """wcextend link-preview line, e.g. `[<url>](<url> (preview))`."""
         return f"[{url}]({url} (preview))"
 
-    def _replace_dokinfo(self, soup):
-        """Replace the document-header (dokinfo) table with a wcextend link
-        preview. Targets the table (incl. its `table-wrap` div) enclosing the
-        first configured pattern; one per page. No-op unless configured."""
-        if not (self.dokinfo_url and self.dokinfo_patterns):
+    def _remove_dokinfo(self, soup):
+        """Remove the document-header (dokinfo) table. Targets the table (incl.
+        its `table-wrap` div) enclosing the first configured pattern; one per
+        page. The header is dropped, not replaced. No-op unless configured."""
+        if not self.dokinfo_patterns:
             return
         for pattern in self.dokinfo_patterns:
             node = soup.find(string=lambda s, p=pattern: s and p in s)
@@ -776,7 +775,7 @@ class Converter:
             if block is None:
                 continue
             target = block.find_parent("div", class_="table-wrap") or block
-            self._tokenize(soup, target, self._link_preview_md(self.dokinfo_url))
+            target.decompose()
             return
 
     def _replace_toc(self, soup):
@@ -1371,15 +1370,14 @@ def weber_config_from_env():
     """Weber-specific Converter kwargs from env. Every value is optional; absent
     values disable the corresponding transform, so non-weber runs are unaffected.
       WCEXTEND_TOC_URL          static TOC macro → link preview
-      WCEXTEND_DOKINFO_URL      document-header table → link preview
-      WCEXTEND_DOKINFO_PATTERNS ||| separated text substrings identifying it
+      WCEXTEND_DOKINFO_PATTERNS ||| separated text substrings identifying the
+                                document-header table, which is removed
       WCEXTEND_MERMAID_MAP      path to the draw.io→mermaid JSON (default mermaid-map.json)
       WEBER_MOVES_FILE          path to the tree-restructuring JSON (default weber-moves.json)
     """
     raw_patterns = os.getenv("WCEXTEND_DOKINFO_PATTERNS", "")
     return {
         "toc_url": os.getenv("WCEXTEND_TOC_URL") or None,
-        "dokinfo_url": os.getenv("WCEXTEND_DOKINFO_URL") or None,
         "dokinfo_patterns": [p.strip() for p in raw_patterns.split("|||") if p.strip()],
         "mermaid_map": _load_mermaid_map(os.getenv("WCEXTEND_MERMAID_MAP", "mermaid-map.json")),
         "move_config": _load_moves(os.getenv("WEBER_MOVES_FILE", "weber-moves.json")),

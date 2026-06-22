@@ -41,7 +41,6 @@ NEXTCLOUD_COLLECTIVE=ISMS-ISO-27001
 STRIP_CONTENT_PATTERNS=Alle Rechte vorbehalten|||Nutzungserlaubnis|||Alle Rechte sind vorbehalten
 
 # weber (wcextend-SmartPicker). Leer = Transform aus.
-WCEXTEND_DOKINFO_URL=https://nextcloud.weber.digital/index.php/apps/wcextend/smartpicker/wcextend-isms-dokinfo-prozess
 WCEXTEND_DOKINFO_PATTERNS=Reviewzyklus|||Training erforderlich für
 WCEXTEND_TOC_URL=https://nextcloud.weber.digital/index.php/apps/wcextend/smartpicker/wcextend-toc
 WCEXTEND_MERMAID_MAP=mermaid-map.json
@@ -146,8 +145,8 @@ nötig — nur erneut **convert + upload** (Abschnitt 3).
 - Seitenzahl, Mermaid-Seiten und „keine draw.io-Artefakte" prüfen (PROPFIND/Skript).
 - Liste aller Seiten mit Diagrammen + Collective-Links erzeugen (siehe
   `diagramm-seiten.md` im Workspace; Generator-Skript in der Projekt-Historie).
-- Stichproben: Info-Panels = `::: …`-Callouts, TOC/Dokinfo = wcextend-Link-Preview,
-  Diagramme = Mermaid.
+- Stichproben: Info-Panels = `::: …`-Callouts, TOC = wcextend-Link-Preview,
+  Dokinfo-Header = entfernt (ersatzlos), Diagramme = Mermaid.
 
 ---
 
