@@ -655,6 +655,11 @@ class Converter:
                 new_pre.append(code_tag)
                 code_macro.replace_with(new_pre)
 
+        # Storage-format status lozenges → inline code (same as the export_view
+        # status handler). Runs before panels/details so statuses nested inside
+        # those blocks are converted before the block is handled.
+        self._replace_storage_status_macros(soup)
+
         # Storage-format panels (info/note/warning/tip) → callout blocks. Must run
         # before the generic ac:structured-macro handler below, else these panels
         # (and their body text) are dropped to an "Unsupported macro" comment.
@@ -778,6 +783,23 @@ class Converter:
                 ph.replace_with(em)
             else:
                 ph.decompose()
+
+    def _replace_storage_status_macros(self, soup):
+        """Storage-format status lozenges (`<ac:structured-macro ac:name="status">`
+        with a `title` parameter) → inline `<code>`, the same pill treatment the
+        export_view handler gives `span.status-macro`. Storage only, so a no-op for
+        export_view pages."""
+        for macro in soup.find_all("ac:structured-macro", {"ac:name": "status"}):
+            if getattr(macro, "decomposed", False):
+                continue
+            title = macro.find("ac:parameter", {"ac:name": "title"})
+            text = title.get_text(strip=True) if title else ""
+            if text:
+                code = soup.new_tag("code")
+                code.string = text
+                macro.replace_with(code)
+            else:
+                macro.decompose()
 
     def _handle_details_macros(self, soup):
         """Confluence "details" (page-properties) macros wrap a properties table in
