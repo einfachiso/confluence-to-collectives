@@ -458,6 +458,17 @@ class Converter:
         "warning": "error",
     }
 
+    # Storage-format panel macro name -> callout type. Templates arrive in storage
+    # format (<ac:structured-macro ac:name="info">…), not the export_view
+    # div.confluence-information-macro that pages carry, so panels need their own
+    # handler or they fall through to the generic unsupported-macro path.
+    STORAGE_PANEL_CALLOUT_TYPES = {
+        "info": "info",
+        "tip": "success",
+        "note": "warn",
+        "warning": "error",
+    }
+
     # Template-variable tags appear ONLY in storage-format template bodies (never
     # in export_view pages). <at:declarations> defines the variables; inline
     # <at:var at:name="X"/> references them. These are XHTML/non-HTML tags that
@@ -533,6 +544,12 @@ class Converter:
         # Runs early so status keywords inside panels and table cells are caught
         # before those blocks are flattened/converted.
         self._replace_status_macros(soup)
+
+        # Template placeholders (<ac:placeholder>…</ac:placeholder>, storage format
+        # only) hold fill-in instructions → italic, our convention for such hints.
+        # Runs early so placeholders inside panels/table cells are marked before
+        # those blocks are converted/flattened.
+        self._replace_placeholders(soup)
 
         # Remove the document-header (dokinfo) table. Runs before the table-cell
         # flatten step below so the header cells aren't mangled first. No-op unless
@@ -634,6 +651,11 @@ class Converter:
                 new_pre.append(code_tag)
                 code_macro.replace_with(new_pre)
 
+        # Storage-format panels (info/note/warning/tip) → callout blocks. Must run
+        # before the generic ac:structured-macro handler below, else these panels
+        # (and their body text) are dropped to an "Unsupported macro" comment.
+        self._replace_storage_panels(soup)
+
         # ac:structured-macro and data-macro-name → HTML comments, BUT keep any
         # rendered image inside (draw.io / Gliffy / etc. embed a PNG preview in
         # export_view) so diagrams still show up in Collectives.
@@ -734,6 +756,20 @@ class Converter:
             code.string = text
             span.replace_with(code)
 
+    def _replace_placeholders(self, soup):
+        """Confluence template placeholders (`<ac:placeholder>…</ac:placeholder>`,
+        storage format only) hold instructions on how to fill the template. Render
+        them as italic `<em>` (our convention for such hints) so the guidance text
+        survives in the migrated template. Empty placeholders are dropped."""
+        for ph in soup.find_all("ac:placeholder"):
+            text = ph.get_text()
+            if text.strip():
+                em = soup.new_tag("em")
+                em.string = text
+                ph.replace_with(em)
+            else:
+                ph.decompose()
+
     def _replace_unsupported_macro(self, soup, macro, name):
         """Drop an unsupported macro, but lift out any rendered <img> it wraps.
 
@@ -750,6 +786,20 @@ class Converter:
             macro.replace_with(wrapper)
         else:
             macro.replace_with(Comment(f" Unsupported macro: {name} "))
+
+    def _replace_storage_panels(self, soup):
+        """Convert storage-format info/note/warning/tip panels to `::: <type> … :::`
+        callout blocks, mirroring the export_view panel handler. The panel body
+        (<ac:rich-text-body>) is converted to markdown and wrapped in a sentinel
+        token. No-op for export_view pages, which carry panels as
+        div.confluence-information-macro (handled separately)."""
+        for macro in soup.find_all("ac:structured-macro"):
+            ctype = self.STORAGE_PANEL_CALLOUT_TYPES.get(macro.get("ac:name", ""))
+            if not ctype:
+                continue
+            body = macro.find("ac:rich-text-body")
+            body_md = self.html_to_markdown(str(body)) if body else ""
+            self._tokenize(soup, macro, f"::: {ctype}\n\n{body_md}\n\n:::")
 
     def _rewrite_internal_links(self, soup, current_path):
         """Mark <a> links that target a migrated Confluence page with a

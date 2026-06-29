@@ -960,10 +960,9 @@ class TestTemplateConversion:
         assert "{{Risk Owner}}" in md   # template variable rendered
         assert "<at:" not in md          # no leftover template tags
         assert "<ac:" not in md          # macro consumed by preprocess_html
-        # Unexpanded storage macro surfaced as a visible marker (not silently
-        # dropped). Its body ("Fill this in.") is still lost — known limitation.
-        assert "[Unsupported macro: info]" in md
-        assert "Fill this in." not in md
+        # The info panel is preserved as a callout with its body (not dropped).
+        assert "::: info" in md
+        assert "Fill this in." in md
 
     def test_convert_template_no_attachment_or_comment_section(self, converter, sample_template):
         md = converter.convert_template(sample_template)
@@ -973,3 +972,47 @@ class TestTemplateConversion:
     def test_convert_template_empty_body(self, converter):
         assert converter.convert_template({}) == ""
         assert converter.convert_template({"body": {}}) == ""
+
+    def test_storage_panel_becomes_callout(self, converter):
+        """Storage-format info/note/warning/tip panels → ::: callout (body kept),
+        not an [Unsupported macro] marker."""
+        info = ('<ac:structured-macro ac:name="info"><ac:rich-text-body>'
+                '<p><strong>INFO:</strong> keep me</p></ac:rich-text-body></ac:structured-macro>')
+        md = converter.convert_template({"body": {"storage": {"value": info}}})
+        assert "::: info" in md
+        assert "keep me" in md
+        assert "Unsupported macro: info" not in md
+
+    def test_storage_panel_type_mapping(self, converter):
+        for name, ctype in [("note", "warn"), ("warning", "error"), ("tip", "success")]:
+            body = (f'<ac:structured-macro ac:name="{name}"><ac:rich-text-body>'
+                    f'<p>b</p></ac:rich-text-body></ac:structured-macro>')
+            md = converter.convert_template({"body": {"storage": {"value": body}}})
+            assert f"::: {ctype}" in md
+
+    def test_non_panel_storage_macro_still_marker(self, converter):
+        """Out-of-scope macros (e.g. details) remain a visible marker."""
+        det = ('<ac:structured-macro ac:name="details"><ac:rich-text-body>'
+               '<table><tr><td>x</td></tr></table></ac:rich-text-body></ac:structured-macro>')
+        md = converter.convert_template({"body": {"storage": {"value": det}}})
+        assert "[Unsupported macro: details]" in md
+
+    def test_placeholder_becomes_italic(self, converter):
+        """<ac:placeholder> fill-in instructions → italic text (kept, not dropped)."""
+        body = "<p>Zweck: <ac:placeholder>Bitte den Zweck angeben</ac:placeholder></p>"
+        md = converter.convert_template({"body": {"storage": {"value": body}}})
+        assert "_Bitte den Zweck angeben_" in md
+
+    def test_placeholder_inside_panel(self, converter):
+        body = ('<ac:structured-macro ac:name="info"><ac:rich-text-body>'
+                '<p><ac:placeholder>Fuelle dies aus</ac:placeholder></p>'
+                '</ac:rich-text-body></ac:structured-macro>')
+        md = converter.convert_template({"body": {"storage": {"value": body}}})
+        assert "::: info" in md
+        assert "_Fuelle dies aus_" in md
+
+    def test_empty_placeholder_dropped(self, converter):
+        body = "<p>Text<ac:placeholder></ac:placeholder></p>"
+        md = converter.convert_template({"body": {"storage": {"value": body}}})
+        assert "ac:placeholder" not in md
+        assert "Text" in md
