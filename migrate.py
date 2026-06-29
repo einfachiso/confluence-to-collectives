@@ -574,8 +574,11 @@ class Converter:
         an <ac:rich-text-body>. By default, unwrap that table so its content
         survives (the generic macro handler would otherwise drop it to a marker).
         When exclude_details is set, remove the macro and its body entirely."""
-        for macro in soup.find_all("ac:structured-macro"):
-            if macro.get("ac:name") != "details":
+        # Filter to details macros only: a details box nests other macros (e.g.
+        # status), and decomposing the parent would invalidate those if they were
+        # in the iteration list. The decomposed guard covers details-in-details.
+        for macro in soup.find_all("ac:structured-macro", {"ac:name": "details"}):
+            if getattr(macro, "decomposed", False):
                 continue
             body = macro.find("ac:rich-text-body")
             if self.exclude_details or not body:
