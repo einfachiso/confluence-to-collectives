@@ -701,3 +701,14 @@ class TestTemplateConversion:
         # extract (default) keeps the table; exclude drops it — neither errors
         assert "Status" in converter.convert_template({"body": {"storage": {"value": det}}})
         Converter(exclude_details=True).convert_template({"body": {"storage": {"value": det}}})
+
+    def test_storage_status_macro_becomes_inline_code(self, converter):
+        """Storage status lozenges → inline code pills (not [Unsupported macro])."""
+        body = ('<p><ac:structured-macro ac:name="status">'
+                '<ac:parameter ac:name="title">NEU</ac:parameter>'
+                '<ac:parameter ac:name="colour">Blue</ac:parameter></ac:structured-macro>'
+                ' oder <ac:structured-macro ac:name="status">'
+                '<ac:parameter ac:name="title">In Arbeit</ac:parameter></ac:structured-macro></p>')
+        md = converter.convert_template({"body": {"storage": {"value": body}}})
+        assert "`NEU`" in md and "`In Arbeit`" in md
+        assert "Unsupported macro: status" not in md

@@ -497,6 +497,11 @@ class Converter:
                 new_pre.append(code_tag)
                 code_macro.replace_with(new_pre)
 
+        # Storage-format status lozenges → inline code (same as the export_view
+        # status handler). Runs before the details handler so statuses inside a
+        # details table are converted before that table is extracted/dropped.
+        self._replace_storage_status_macros(soup)
+
         # Details (page-properties) macro: extract its inner table so the content
         # survives (or drop it entirely when exclude_details). Runs before the
         # generic handler below, else it degrades to an "Unsupported macro" marker.
@@ -568,6 +573,23 @@ class Converter:
             code = soup.new_tag("code")
             code.string = text
             span.replace_with(code)
+
+    def _replace_storage_status_macros(self, soup):
+        """Storage-format status lozenges (`<ac:structured-macro ac:name="status">`
+        with a `title` parameter) → inline `<code>`, the same pill treatment the
+        export_view handler gives `span.status-macro`. Storage only, so a no-op for
+        export_view pages."""
+        for macro in soup.find_all("ac:structured-macro", {"ac:name": "status"}):
+            if getattr(macro, "decomposed", False):
+                continue
+            title = macro.find("ac:parameter", {"ac:name": "title"})
+            text = title.get_text(strip=True) if title else ""
+            if text:
+                code = soup.new_tag("code")
+                code.string = text
+                macro.replace_with(code)
+            else:
+                macro.decompose()
 
     def _handle_details_macros(self, soup):
         """Confluence "details" (page-properties) macros wrap a properties table in
