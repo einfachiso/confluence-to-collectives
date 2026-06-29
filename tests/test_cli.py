@@ -48,6 +48,13 @@ class TestHelp:
         assert result.exit_code == 0
         assert "--space" in result.output
         assert "--target-parent" in result.output
+        assert "--include-templates" in result.output
+
+    def test_import_templates_help(self, runner):
+        result = runner.invoke(cli, ["import-templates", "--help"])
+        assert result.exit_code == 0
+        assert "page-templates" in result.output
+        assert "--space" in result.output
 
     def test_version(self, runner):
         result = runner.invoke(cli, ["--version"])
@@ -106,3 +113,26 @@ class TestDryRun:
         with patch("migrate.STATE_FILE", str(tmp_path / ".migration-state.json")):
             result = runner.invoke(cli, ["status"])
             assert "No migration state" in result.output
+
+
+class TestImportTemplatesCLI:
+    def test_space_required(self, runner):
+        result = runner.invoke(cli, ["import-templates"])
+        assert result.exit_code != 0
+
+    def test_dry_run_lists_without_nextcloud(self, runner):
+        """--dry-run needs only Confluence creds and never touches Nextcloud."""
+        env = {
+            "CONFLUENCE_BASE_URL": "https://test.atlassian.net",
+            "CONFLUENCE_USERNAME": "user",
+            "CONFLUENCE_API_TOKEN": "token",
+        }
+        templates = [{"templateId": "1", "name": "Risk Assessment", "templateType": "page"}]
+        with patch.dict(os.environ, env, clear=False), \
+             patch("migrate.ConfluenceClient.verify_auth"), \
+             patch("migrate.ConfluenceClient.get_space_templates", return_value=templates), \
+             patch("migrate.NextcloudClient") as mock_nc:
+            result = runner.invoke(cli, ["import-templates", "--space", "TEAM", "--dry-run"])
+            assert result.exit_code == 0
+            assert "Risk Assessment" in result.output
+            mock_nc.assert_not_called()

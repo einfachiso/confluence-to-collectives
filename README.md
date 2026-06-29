@@ -142,6 +142,27 @@ python migrate.py upload --target-parent MigratedPages
 python migrate.py status
 ```
 
+### Space Templates
+
+Confluence space page-templates can be imported as native Collectives page
+templates (they land in the collective's hidden `.templates/` folder and show up
+in the New-page template picker):
+
+```bash
+# Import a space's templates (standalone)
+python migrate.py import-templates --space SPACE_KEY
+
+# Preview without writing (needs only Confluence credentials)
+python migrate.py import-templates --space SPACE_KEY --dry-run
+
+# Or fold templates into a full migration run
+python migrate.py migrate --space SPACE_KEY --include-templates
+```
+
+Template bodies come from Confluence in *storage* format (templates have no
+rendered `export_view`). Template variables such as `<at:var at:name="Owner"/>`
+are rendered as `{{Owner}}` placeholders. See **Limitations** for macro handling.
+
 ### Command Options
 
 | Option | Commands | Description |
@@ -152,6 +173,8 @@ python migrate.py status
 | `--exclude-images` | export, convert, migrate | Skip image attachments |
 | `--exclude-attachments` | export, convert, migrate | Skip all attachments |
 | `--target-parent NAME` | upload, migrate | Top folder in the collective (default: `MigratedPages`). Use `''` to import at the collective base — the space homepage becomes the landing page |
+| `--include-templates` | migrate | Also import the space's page-templates into the collective's `.templates/` folder (requires `--space`) |
+| `--space KEY` | import-templates | Confluence space whose page-templates to import (required) |
 | `--dry-run` | all | Preview actions without changes |
 | `--debug` | all | Enable debug logging |
 | `--log-file PATH` | all | Write logs to file |
@@ -197,6 +220,7 @@ convert_data/{space_key}/         # Phase 2 output (uploaded in Phase 3)
 - **Footer comments only** — Inline comments (annotations on specific text) are not migrated; footer comments and their reply chains are fully supported.
 - **No permission migration** — Page-level permissions from Confluence are not transferred.
 - **Unsupported macros** — Diagram macros (Draw.io, Gliffy, etc.) render via their static image preview, but other third-party macro content (e.g. Jira) is replaced with HTML comments. SVG diagram previews are demoted to attachment links, since Collectives blocks SVG rendering.
+- **Space templates** — Imported template bodies are storage-format XHTML (templates have no rendered `export_view`), so any macro inside a template is *unexpanded*: it is surfaced as a visible `[Unsupported macro: NAME]` marker and its body is dropped. Template variables become `{{Name}}` placeholders. A renamed template leaves its old file behind (uploads overwrite by path; they do not purge).
 - **Sequential processing** — Pages are processed one at a time (no parallel downloads).
 - **Filename length** — Titles are capped at 200 characters; special characters are stripped.
 

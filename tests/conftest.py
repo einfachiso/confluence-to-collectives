@@ -52,6 +52,35 @@ def sample_page_data(sample_page_html, sample_comments):
 
 
 @pytest.fixture
+def sample_template():
+    """A Confluence v1 space page-template (storage body with a template variable,
+    an <at:declarations> block, and an unexpanded macro)."""
+    return {
+        "templateId": "987654321",
+        "name": "Risk Assessment",
+        "templateType": "page",
+        "editorVersion": "v2",
+        "labels": [],
+        "space": {"key": "TEAM"},
+        "body": {
+            "storage": {
+                "value": (
+                    "<at:declarations>"
+                    '<at:string at:name="Risk Owner" />'
+                    "</at:declarations>"
+                    "<h2>Risk Assessment</h2>"
+                    '<p>Owner: <at:var at:name="Risk Owner" /></p>'
+                    '<ac:structured-macro ac:name="info">'
+                    "<ac:rich-text-body><p>Fill this in.</p></ac:rich-text-body>"
+                    "</ac:structured-macro>"
+                ),
+                "representation": "storage",
+            }
+        },
+    }
+
+
+@pytest.fixture
 def mock_confluence_response():
     """Factory for mock Confluence API responses."""
 
