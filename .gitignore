@@ -11,7 +11,8 @@ __pycache__/
 # Migration data - current project specific
 export_data/
 convert_data/
-.migration-state.json
+convert_data_old/
+.migration-state.json*
 data/
 mermaid-map.json
 
@@ -40,6 +41,7 @@ Thumbs.db
 
 # Logs - various
 *.log
+*.out
 npm-debug.log*
 yarn-debug.log*
 tmp/
