@@ -479,9 +479,13 @@ class Converter:
 
     def __init__(self, exclude_images=False, exclude_attachments=False, strip_patterns=None,
                  mermaid_map=None, toc_url=None, dokinfo_patterns=None,
-                 move_config=None):
+                 move_config=None, exclude_details=False):
         self.exclude_images = exclude_images
         self.exclude_attachments = exclude_attachments
+        # Confluence "details" (page-properties) macro handling. Default: extract
+        # the inner table so its content survives. When True, drop the macro and
+        # its body entirely (used where the properties box is unwanted).
+        self.exclude_details = exclude_details
         # Text substrings; any block (table/div/etc.) whose text contains one is
         # removed during preprocessing. Used to drop boilerplate such as a
         # per-page copyright box. Configured via STRIP_CONTENT_PATTERNS.
@@ -656,6 +660,11 @@ class Converter:
         # (and their body text) are dropped to an "Unsupported macro" comment.
         self._replace_storage_panels(soup)
 
+        # Details (page-properties) macro: extract its inner table so the content
+        # survives (or drop it entirely when exclude_details). Runs before the
+        # generic handler below, else it degrades to an "Unsupported macro" marker.
+        self._handle_details_macros(soup)
+
         # ac:structured-macro and data-macro-name → HTML comments, BUT keep any
         # rendered image inside (draw.io / Gliffy / etc. embed a PNG preview in
         # export_view) so diagrams still show up in Collectives.
@@ -769,6 +778,21 @@ class Converter:
                 ph.replace_with(em)
             else:
                 ph.decompose()
+
+    def _handle_details_macros(self, soup):
+        """Confluence "details" (page-properties) macros wrap a properties table in
+        an <ac:rich-text-body>. By default, unwrap that table so its content
+        survives (the generic macro handler would otherwise drop it to a marker).
+        When exclude_details is set, remove the macro and its body entirely."""
+        for macro in soup.find_all("ac:structured-macro"):
+            if macro.get("ac:name") != "details":
+                continue
+            body = macro.find("ac:rich-text-body")
+            if self.exclude_details or not body:
+                macro.decompose()
+            else:
+                macro.replace_with(body)   # promote the table out of the macro
+                body.unwrap()              # drop the rich-text-body wrapper
 
     def _replace_unsupported_macro(self, soup, macro, name):
         """Drop an unsupported macro, but lift out any rendered <img> it wraps.
@@ -1536,6 +1560,8 @@ def weber_config_from_env():
                                 document-header table, which is removed
       WCEXTEND_MERMAID_MAP      path to the draw.io→mermaid JSON (default mermaid-map.json)
       WEBER_MOVES_FILE          path to the tree-restructuring JSON (default weber-moves.json)
+      WCEXTEND_EXCLUDE_DETAILS  drop the details/page-properties box (default on for
+                                weber; set to 0 to extract its table instead)
     """
     raw_patterns = os.getenv("WCEXTEND_DOKINFO_PATTERNS", "")
     return {
@@ -1543,6 +1569,8 @@ def weber_config_from_env():
         "dokinfo_patterns": [p.strip() for p in raw_patterns.split("|||") if p.strip()],
         "mermaid_map": _load_mermaid_map(os.getenv("WCEXTEND_MERMAID_MAP", "mermaid-map.json")),
         "move_config": _load_moves(os.getenv("WEBER_MOVES_FILE", "weber-moves.json")),
+        "exclude_details": os.getenv("WCEXTEND_EXCLUDE_DETAILS", "1").lower()
+                           not in ("0", "false", "no"),
     }
 
 
