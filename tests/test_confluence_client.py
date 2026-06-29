@@ -162,3 +162,45 @@ class TestSpaceResolution:
         with patch.object(client.session, "request", return_value=mock_resp):
             with pytest.raises(click.ClickException, match="not found"):
                 client.get_space_by_key("NOPE")
+
+
+class TestGetSpaceTemplates:
+    @staticmethod
+    def _resp(results):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {"results": results}
+        r.raise_for_status = MagicMock()
+        return r
+
+    def test_paginates_start_limit(self, client):
+        page1 = [{"templateId": str(i), "name": f"T{i}", "templateType": "page"}
+                 for i in range(25)]
+        page2 = [{"templateId": str(i), "name": f"T{i}", "templateType": "page"}
+                 for i in range(25, 28)]
+        with patch.object(client.session, "request",
+                          side_effect=[self._resp(page1), self._resp(page2)]) as mock_req:
+            out = client.get_space_templates("TEAM")
+            assert len(out) == 28
+            assert mock_req.call_count == 2
+            # second request advanced the start offset by the page size
+            assert mock_req.call_args_list[1].kwargs["params"]["start"] == 25
+
+    def test_filters_blueprint_templates(self, client):
+        results = [
+            {"templateId": "1", "name": "Page T", "templateType": "page"},
+            {"templateId": "2", "name": "Blueprint T", "templateType": "blueprint"},
+        ]
+        with patch.object(client.session, "request", side_effect=[self._resp(results)]):
+            out = client.get_space_templates("TEAM")
+            assert [t["templateId"] for t in out] == ["1"]
+
+    def test_passes_space_key_and_expand(self, client):
+        with patch.object(client.session, "request",
+                          side_effect=[self._resp([])]) as mock_req:
+            client.get_space_templates("TEAM")
+            params = mock_req.call_args_list[0].kwargs["params"]
+            assert params["spaceKey"] == "TEAM"
+            assert params["expand"] == "body,labels"
+            url = mock_req.call_args_list[0][0][1]
+            assert url.endswith("/wiki/rest/api/template/page")

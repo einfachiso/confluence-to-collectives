@@ -3,6 +3,7 @@
 
 __version__ = "0.6.0"
 
+import html
 import json
 import logging
 import os
@@ -224,6 +225,35 @@ class ConfluenceClient:
     def get_all_spaces(self):
         return list(self._paginate("/wiki/api/v2/spaces"))
 
+    # -- space templates --------------------------------------------------
+
+    def get_space_templates(self, space_key):
+        """List a space's page content-templates (Confluence v1 REST API).
+
+        Templates have no v2 endpoint, and the v1 listing is start/limit paged
+        (not cursor-based, so _paginate does not apply). Bodies come back in
+        STORAGE format via expand=body — there is no export_view for templates.
+        Blueprint-derived entries (templateType != "page") cannot be recreated
+        as plain content and are skipped.
+        """
+        out, start, limit = [], 0, 25
+        while True:
+            data = self._get_json(
+                "/wiki/rest/api/template/page",
+                spaceKey=space_key, expand="body,labels", start=start, limit=limit,
+            )
+            batch = data.get("results", [])
+            out.extend(t for t in batch if t.get("templateType") == "page")
+            if len(batch) < limit:
+                break
+            start += limit
+        return out
+
+    def get_template(self, template_id):
+        """Fetch a single template by id (body included by default). Fallback
+        for the rare list entry that arrives without an expanded body."""
+        return self._get_json(f"/wiki/rest/api/template/{template_id}")
+
     # -- pages ------------------------------------------------------------
 
     def get_space_pages(self, space_id):
@@ -332,6 +362,14 @@ class Converter:
     #   /wiki/spaces/TEAM/pages/67890/Other+Page
     #   https://x.atlassian.net/wiki/spaces/TEAM/pages/67890
     PAGE_LINK_RE = re.compile(r"/pages/(\d+)")
+
+    # Template-variable tags appear ONLY in storage-format template bodies (never
+    # in export_view pages). <at:declarations> defines the variables; inline
+    # <at:var at:name="X"/> references them. These are XHTML/non-HTML tags that
+    # html.parser mishandles, so they are dealt with by a regex pre-pass on the
+    # raw storage XHTML before BeautifulSoup ever sees it.
+    AT_DECLARATIONS_RE = re.compile(r"<at:declarations>.*?</at:declarations>", re.S)
+    AT_VAR_RE = re.compile(r'<at:var\b[^>]*?at:name="([^"]*)"[^>]*?>(?:\s*</at:var>)?', re.S)
 
     def __init__(self, exclude_images=False, exclude_attachments=False):
         self.exclude_images = exclude_images
@@ -592,6 +630,43 @@ class Converter:
 
         return md
 
+    def _substitute_template_variables(self, body_html):
+        """Render Confluence template variables for Collectives (which has no
+        variable concept): drop the <at:declarations> metadata block and turn
+        each inline <at:var at:name="X"/> into the Markdown placeholder {{X}}."""
+        body_html = self.AT_DECLARATIONS_RE.sub("", body_html)
+        return self.AT_VAR_RE.sub(lambda m: "{{" + html.unescape(m.group(1)) + "}}", body_html)
+
+    # An unsupported-macro HTML comment left by preprocess_html (matched so a
+    # template can surface it as visible text instead of letting html2text drop it).
+    UNSUPPORTED_MACRO_COMMENT_RE = re.compile(r"<!--\s*Unsupported macro:\s*(.*?)\s*-->")
+
+    def convert_template(self, template_data):
+        """Convert one Confluence space page-template (storage XHTML) to Markdown.
+
+        Templates have no attachments, comments, or children, so this is just
+        variable-substitution → preprocess_html → html2text — no link map and
+        none of convert_page's appended ## Comments / ## Attachments sections.
+
+        Storage-format templates are full of unexpanded <ac:structured-macro>
+        elements (no rendered preview, unlike export_view pages). preprocess_html
+        turns each into an "<!-- Unsupported macro: NAME -->" comment, which
+        html2text would then silently strip. Since macros are common in templates,
+        we surface each as a visible "[Unsupported macro: NAME]" marker so the
+        author can re-add it. The macro BODY is still lost (a full storage-format
+        macro renderer is out of scope) — see the README/limitations.
+        """
+        body = template_data.get("body", {})
+        if isinstance(body, dict):
+            body_html = (body.get("storage", {}) or {}).get("value", "") or ""
+        else:
+            body_html = body or ""
+        body_html = self._substitute_template_variables(body_html)
+        processed = self.preprocess_html(body_html)
+        processed = self.UNSUPPORTED_MACRO_COMMENT_RE.sub(
+            r"<p>[Unsupported macro: \1]</p>", processed)
+        return self.html_to_markdown(processed)
+
     def format_comments(self, comments):
         """Format comments as a ## Comments section."""
         if not comments:
@@ -762,6 +837,14 @@ class NextcloudClient:
     # older versions used "Collectives". Probed in verify_connection().
     COLLECTIVES_DIRS = (".Collectives", "Collectives")
 
+    # Collectives (2.17.0+) keeps page-templates as ordinary pages inside a hidden
+    # ".templates" folder at the collective root — template-ness is purely folder
+    # location, with no DB flag. The folder needs an index page or Collectives
+    # won't list its contents; this marker is the documented index content.
+    TEMPLATES_DIR = ".templates"
+    TEMPLATES_INDEX = "Readme.md"
+    TEMPLATES_INDEX_CONTENT = "## This folder contains template files for the collective\n"
+
     def __init__(self, base_url, username, password, collective):
         self.base_url = base_url.rstrip("/")
         self.username = username
@@ -931,6 +1014,33 @@ class NextcloudClient:
         url = f"{self.dav_base}/{self._remote(path).lstrip('/')}"
         resp = self.session.request("PROPFIND", url, headers={"Depth": "0"})
         return resp.status_code in (200, 207)
+
+    def upload_text(self, remote_path, text, content_type="text/markdown; charset=utf-8"):
+        """PUT in-memory text to a path under the collective root (no temp file)."""
+        remote_path = self._remote(remote_path)
+        url = f"{self.dav_base}/{remote_path.lstrip('/')}"
+        resp = self.session.put(url, data=text.encode("utf-8"),
+                                headers={"Content-Type": content_type})
+        if resp.status_code not in (200, 201, 204):
+            raise click.ClickException(
+                f"Upload failed for {remote_path}: HTTP {resp.status_code}"
+            )
+        log.debug("Uploaded: %s", remote_path)
+
+    def ensure_templates_folder(self):
+        """Create the hidden .templates/ folder at the collective root and seed
+        its required index page if missing. Idempotent (MKCOL tolerates 405)."""
+        self.mkdir_p(self.TEMPLATES_DIR)
+        index = f"{self.TEMPLATES_DIR}/{self.TEMPLATES_INDEX}"
+        if not self.exists(index):
+            self.upload_text(index, self.TEMPLATES_INDEX_CONTENT)
+
+    def upload_template(self, title, markdown):
+        """Write one template as .templates/<title>.md (title pre-sanitized by
+        the caller). Overwrites by path, so re-runs update in place."""
+        remote_path = f"{self.TEMPLATES_DIR}/{title}.md"
+        self.upload_text(remote_path, markdown)
+        return remote_path
 
 
 # ---------------------------------------------------------------------------
@@ -1521,8 +1631,11 @@ def upload(target_parent, dry_run, debug, log_file):
 @click.option("--target-parent", default="MigratedPages",
               help="Top folder in the collective. Use '' to import at the collective "
                    "base (the space homepage becomes the landing page).")
+@click.option("--include-templates", is_flag=True,
+              help="Also import the space's page-templates into the collective's "
+                   ".templates/ folder (requires --space).")
 def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
-            target_parent, dry_run, debug, log_file):
+            target_parent, include_templates, dry_run, debug, log_file):
     """Run full migration pipeline: export → convert → upload."""
     setup_logging(debug, log_file)
 
@@ -1816,6 +1929,17 @@ def migrate(space_key, pages, all_spaces, exclude_images, exclude_attachments,
             page_rec["error"] = f"Upload failed: {e}"
             state.set_page(pid, page_rec)
 
+    # --- Templates (opt-in) ---
+    if include_templates:
+        if not space_key:
+            log.warning("--include-templates requires --space; skipping templates")
+        else:
+            click.echo("\n" + "=" * 60)
+            click.echo("Phase 4: Templates")
+            click.echo("=" * 60)
+            t_ok, t_fail = _run_template_import(conf_client, converter, nc, space_key, dry_run)
+            click.echo(f"Templates: {t_ok} ok, {t_fail} failed")
+
     # Final summary
     summary = state.summary()
     click.echo("\n" + "=" * 60)
@@ -1861,6 +1985,94 @@ def status(dry_run, debug, log_file):
             click.echo(f"  [{pid}] {p['title']}: {p.get('error', 'unknown error')}")
 
     sys.exit(EXIT_SUCCESS)
+
+
+# -- import-templates -----------------------------------------------------
+
+
+def _run_template_import(conf_client, converter, nc, space_key, dry_run):
+    """Fetch a space's page-templates, convert each, and upload them into the
+    collective's hidden .templates/ folder. Returns (ok, fail) counts.
+
+    Shared by the standalone `import-templates` command and `migrate
+    --include-templates`. Per-template failures are logged and counted; they do
+    not abort the run.
+    """
+    templates = conf_client.get_space_templates(space_key)
+    log.info("Found %d page template(s) in space %s", len(templates), space_key)
+
+    if dry_run:
+        click.echo(f"\n[DRY RUN] {len(templates)} template(s) → .templates/")
+        for t in templates:
+            click.echo(f"  Template: {t.get('name', '?')} (ID: {t.get('templateId')})")
+        return (0, 0)
+
+    nc.ensure_templates_folder()
+    existing, ok, fail = set(), 0, 0
+    for t in templates:
+        name = t.get("name", "untitled")
+        title = converter.sanitize_filename(name, existing)
+        existing.add(title)
+        try:
+            md = converter.convert_template(t)
+            remote = nc.upload_template(title, md)
+            log.info("Uploaded template: %s → %s", name, remote)
+            ok += 1
+        except Exception as e:
+            log.error("Failed to import template '%s': %s", name, e)
+            fail += 1
+    return (ok, fail)
+
+
+@cli.command(name="import-templates")
+@click.option("--space", "space_key", required=True, help="Confluence space key.")
+@add_options(COMMON_OPTIONS)
+def import_templates(space_key, dry_run, debug, log_file):
+    """Import a Confluence space's page-templates as Collectives page templates."""
+    setup_logging(debug, log_file)
+    require_env("CONFLUENCE_BASE_URL", "CONFLUENCE_USERNAME", "CONFLUENCE_API_TOKEN")
+    if not dry_run:
+        require_env("NEXTCLOUD_URL", "NEXTCLOUD_USERNAME",
+                    "NEXTCLOUD_PASSWORD", "NEXTCLOUD_COLLECTIVE")
+
+    conf_client = ConfluenceClient(
+        os.getenv("CONFLUENCE_BASE_URL"),
+        os.getenv("CONFLUENCE_USERNAME"),
+        os.getenv("CONFLUENCE_API_TOKEN"),
+    )
+    try:
+        conf_client.verify_auth()
+    except click.ClickException:
+        sys.exit(EXIT_AUTH)
+    except Exception as e:
+        log.error("Authentication failed: %s", e)
+        sys.exit(EXIT_AUTH)
+
+    converter = Converter()
+
+    nc = None
+    if not dry_run:
+        nc = NextcloudClient(
+            os.getenv("NEXTCLOUD_URL"),
+            os.getenv("NEXTCLOUD_USERNAME"),
+            os.getenv("NEXTCLOUD_PASSWORD"),
+            os.getenv("NEXTCLOUD_COLLECTIVE"),
+        )
+        try:
+            nc.verify_connection()
+        except click.ClickException:
+            raise
+        except Exception as e:
+            raise click.ClickException(f"Nextcloud connection failed: {e}")
+
+    ok, fail = _run_template_import(conf_client, converter, nc, space_key, dry_run)
+
+    click.echo("\n" + "=" * 60)
+    click.echo(f"Templates imported: {ok} ok, {fail} failed")
+    click.echo("=" * 60)
+    if dry_run or fail == 0:
+        sys.exit(EXIT_SUCCESS)
+    sys.exit(EXIT_FAILURE if ok == 0 else EXIT_PARTIAL)
 
 
 # ---------------------------------------------------------------------------

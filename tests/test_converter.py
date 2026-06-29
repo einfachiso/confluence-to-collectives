@@ -626,3 +626,46 @@ class TestFullConversion:
         assert "API Gateway" in md
         # No block-level headings should remain in table
         assert "<h2>" not in md
+
+
+class TestTemplateConversion:
+    def test_at_var_becomes_placeholder(self, converter):
+        out = converter._substitute_template_variables(
+            'x <at:var at:name="Owner"/> y')
+        assert out == "x {{Owner}} y"
+
+    def test_at_var_paired_form(self, converter):
+        out = converter._substitute_template_variables(
+            'x <at:var at:name="Owner"></at:var> y')
+        assert out == "x {{Owner}} y"
+
+    def test_at_var_name_with_spaces(self, converter):
+        out = converter._substitute_template_variables(
+            'Owner: <at:var at:name="Risk Owner" />')
+        assert out == "Owner: {{Risk Owner}}"
+
+    def test_declarations_stripped(self, converter):
+        out = converter._substitute_template_variables(
+            '<at:declarations><at:string at:name="Owner"/></at:declarations><p>Hi</p>')
+        assert "<at:declarations>" not in out
+        assert "<at:string" not in out
+        assert "<p>Hi</p>" in out
+
+    def test_convert_template_renders_variable_and_macro(self, converter, sample_template):
+        md = converter.convert_template(sample_template)
+        assert "{{Risk Owner}}" in md   # template variable rendered
+        assert "<at:" not in md          # no leftover template tags
+        assert "<ac:" not in md          # macro consumed by preprocess_html
+        # Unexpanded storage macro surfaced as a visible marker (not silently
+        # dropped). Its body ("Fill this in.") is still lost — known limitation.
+        assert "[Unsupported macro: info]" in md
+        assert "Fill this in." not in md
+
+    def test_convert_template_no_attachment_or_comment_section(self, converter, sample_template):
+        md = converter.convert_template(sample_template)
+        assert "## Attachments" not in md
+        assert "## Comments" not in md
+
+    def test_convert_template_empty_body(self, converter):
+        assert converter.convert_template({}) == ""
+        assert converter.convert_template({"body": {}}) == ""

@@ -183,3 +183,49 @@ class TestResolveCollective:
             {"id": 1, "name": "Other", "slug": "Other"}]}}}
         with patch.object(nc.session, "get", return_value=lst):
             assert nc.resolve_collective() is False
+
+
+class TestEnsureTemplatesFolder:
+    def test_creates_and_seeds_index(self, nc):
+        def req(method, url, **kw):
+            r = MagicMock()
+            r.status_code = 201 if method == "MKCOL" else 404  # PROPFIND → not found
+            return r
+
+        put_resp = MagicMock(status_code=201)
+        with patch.object(nc.session, "request", side_effect=req) as mock_req, \
+             patch.object(nc.session, "put", return_value=put_resp) as mock_put:
+            nc.ensure_templates_folder()
+            mkcol = [c for c in mock_req.call_args_list if c[0][0] == "MKCOL"]
+            assert len(mkcol) == 1
+            assert mkcol[0][0][1].endswith("/.templates")
+            assert mock_put.call_count == 1
+            assert mock_put.call_args[0][0].endswith("/.templates/Readme.md")
+            assert b"template files for the collective" in mock_put.call_args.kwargs["data"]
+
+    def test_skips_index_when_present(self, nc):
+        def req(method, url, **kw):
+            r = MagicMock()
+            r.status_code = 201 if method == "MKCOL" else 207  # PROPFIND → exists
+            return r
+
+        with patch.object(nc.session, "request", side_effect=req), \
+             patch.object(nc.session, "put") as mock_put:
+            nc.ensure_templates_folder()
+            mock_put.assert_not_called()
+
+
+class TestUploadTemplate:
+    def test_puts_to_templates_path(self, nc):
+        put_resp = MagicMock(status_code=201)
+        with patch.object(nc.session, "put", return_value=put_resp) as mock_put:
+            remote = nc.upload_template("My Template", "# Body")
+            assert remote == ".templates/My Template.md"
+            assert mock_put.call_args[0][0].endswith("/.templates/My Template.md")
+            assert mock_put.call_args.kwargs["data"] == b"# Body"
+
+    def test_raises_on_bad_status(self, nc):
+        put_resp = MagicMock(status_code=500)
+        with patch.object(nc.session, "put", return_value=put_resp):
+            with pytest.raises(click.ClickException, match="Upload failed"):
+                nc.upload_template("X", "y")
