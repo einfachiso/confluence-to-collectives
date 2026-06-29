@@ -371,9 +371,14 @@ class Converter:
     AT_DECLARATIONS_RE = re.compile(r"<at:declarations>.*?</at:declarations>", re.S)
     AT_VAR_RE = re.compile(r'<at:var\b[^>]*?at:name="([^"]*)"[^>]*?>(?:\s*</at:var>)?', re.S)
 
-    def __init__(self, exclude_images=False, exclude_attachments=False):
+    def __init__(self, exclude_images=False, exclude_attachments=False,
+                 exclude_details=False):
         self.exclude_images = exclude_images
         self.exclude_attachments = exclude_attachments
+        # Confluence "details" (page-properties) macro handling. Default: extract
+        # the inner table so its content survives. When True, drop the macro and
+        # its body entirely (used where the properties box is unwanted).
+        self.exclude_details = exclude_details
         # page_id -> output path relative to the space root (e.g. "Section/Leaf.md").
         # Populated via set_link_map() so internal page links can be rewritten to
         # relative links between the migrated Markdown files.
@@ -492,6 +497,11 @@ class Converter:
                 new_pre.append(code_tag)
                 code_macro.replace_with(new_pre)
 
+        # Details (page-properties) macro: extract its inner table so the content
+        # survives (or drop it entirely when exclude_details). Runs before the
+        # generic handler below, else it degrades to an "Unsupported macro" marker.
+        self._handle_details_macros(soup)
+
         # ac:structured-macro and data-macro-name → HTML comments, BUT keep any
         # rendered image inside (draw.io / Gliffy / etc. embed a PNG preview in
         # export_view) so diagrams still show up in Collectives.
@@ -558,6 +568,21 @@ class Converter:
             code = soup.new_tag("code")
             code.string = text
             span.replace_with(code)
+
+    def _handle_details_macros(self, soup):
+        """Confluence "details" (page-properties) macros wrap a properties table in
+        an <ac:rich-text-body>. By default, unwrap that table so its content
+        survives (the generic macro handler would otherwise drop it to a marker).
+        When exclude_details is set, remove the macro and its body entirely."""
+        for macro in soup.find_all("ac:structured-macro"):
+            if macro.get("ac:name") != "details":
+                continue
+            body = macro.find("ac:rich-text-body")
+            if self.exclude_details or not body:
+                macro.decompose()
+            else:
+                macro.replace_with(body)   # promote the table out of the macro
+                body.unwrap()              # drop the rich-text-body wrapper
 
     def _replace_unsupported_macro(self, soup, macro, name):
         """Drop an unsupported macro, but lift out any rendered <img> it wraps.

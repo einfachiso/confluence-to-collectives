@@ -669,3 +669,23 @@ class TestTemplateConversion:
     def test_convert_template_empty_body(self, converter):
         assert converter.convert_template({}) == ""
         assert converter.convert_template({"body": {}}) == ""
+
+    def test_details_macro_table_extracted(self, converter):
+        """The details (page-properties) macro's inner table is preserved (default)."""
+        det = ('<ac:structured-macro ac:name="details"><ac:rich-text-body>'
+               '<table><tr><th>Verantwortlicher</th><td>Max</td></tr></table>'
+               '</ac:rich-text-body></ac:structured-macro>')
+        md = converter.convert_template({"body": {"storage": {"value": det}}})
+        assert "Verantwortlicher" in md and "Max" in md
+        assert "Unsupported macro: details" not in md
+        assert "<ac:" not in md
+
+    def test_details_macro_excluded_when_flagged(self):
+        """exclude_details drops the macro and its table entirely."""
+        c = Converter(exclude_details=True)
+        det = ('<ac:structured-macro ac:name="details"><ac:rich-text-body>'
+               '<table><tr><th>Verantwortlicher</th><td>Max</td></tr></table>'
+               '</ac:rich-text-body></ac:structured-macro>')
+        md = c.convert_template({"body": {"storage": {"value": det}}})
+        assert "Verantwortlicher" not in md
+        assert "Unsupported macro: details" not in md
